@@ -1,0 +1,36 @@
+# OMLight
+
+OI.Share 代替の軽量カメラアプリ。公開 OPC プロトコルのクリーンルーム実装。
+
+カメラの Wi-Fi につないで、写真の一覧・保存・撮影ができる。余計な機能なし。
+
+## 使い方
+
+1. カメラの Wi-Fi に接続 (カメラの液晶に表示される SSID)
+2. アプリを開く → 自動で接続
+3. 写真タブで選んで保存、撮影タブでリモート撮影
+
+[リリース](https://github.com/nico2525nn/omlight/releases)から APK を入手。
+
+## 特徴
+
+- カメラ通信だけカメラ Wi-Fi に流し、普段の通信を邪魔しない
+- バックグラウンド転送 (中断しても後で再開できる)
+- 転送の完全性保証 (サイズ・形式検証、壊れたファイルは保存しない)
+- RAW (ORF) 含め原本のまま保存
+
+## 対応機種
+
+- E-M5 Mark II: 実機確認済み
+- その他 OM-D / PEN / OM 系: 仕組み上は対応 (未検証、報告歓迎)
+
+## 開発
+
+```sh
+cd omlight
+./gradlew :app:assembleDebug          # ビルド
+./gradlew :app:testDebugUnitTest      # テスト
+python3 mockcam.py --port 8080       # モックカメラ (エミュレータ用)
+```
+
+詳細は [`OMLight_OPC_Protocol_Guide_JA.md`](OMLight_OPC_Protocol_Guide_JA.md)。
