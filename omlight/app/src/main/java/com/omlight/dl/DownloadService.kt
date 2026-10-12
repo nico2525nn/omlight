@@ -198,6 +198,13 @@ class DownloadService : LifecycleService() {
             store.setActive(item)
             try {
                 ensureClient()
+                // Long queues outlive the default link timeout: refresh
+                // every 10 files (cheap no-op when unsupported).
+                if (_state.value.done % 10 == 0) {
+                    try {
+                        CamSession.peek()?.extendTimeout()
+                    } catch (_: Exception) { /* best-effort */ }
+                }
                 val sha = downloadOne(item)
                 store.markDone(item.path, item.sizeBytes, item.takenAt, sha)
                 store.setActive(null)

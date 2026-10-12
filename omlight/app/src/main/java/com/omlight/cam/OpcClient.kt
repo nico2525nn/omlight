@@ -814,6 +814,18 @@ class OpcClient(private val t: OpcTransport) {
     }
 
     /**
+     * Extend the camera link timeout (set_timeout, 1800s like stock).
+     * Fire-and-forget: call after connect and periodically during long
+     * transfers. Bodies without the command ignore it (errorcode path).
+     */
+    fun extendTimeout(seconds: Int = 1800) {
+        if (info.commands.isNotEmpty() && !info.supports("set_timeout")) return
+        try {
+            t.getString("set_timeout.cgi", "timeoutsec" to seconds.toString())
+        } catch (_: IOException) { /* best-effort keepalive */ }
+    }
+
+    /**
      * Sync the camera clock to the phone (spec: set_utctimediff).
      * Best-effort: silently ignored when the camera lacks the command.
      * Keeps FAT timestamps (and our date filter) sane.

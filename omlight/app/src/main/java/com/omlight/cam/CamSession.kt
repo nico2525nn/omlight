@@ -63,6 +63,10 @@ object CamSession {
             try {
                 c.syncClock()
             } catch (_: Exception) { /* non-fatal */ }
+            // Keep the link alive for long transfers (stock: 1800s).
+            try {
+                c.extendTimeout()
+            } catch (_: Exception) { /* non-fatal */ }
             client = c
             return c
         }
