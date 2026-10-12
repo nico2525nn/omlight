@@ -22,11 +22,10 @@ class TransferStore(ctx: Context) {
 
     data class Done(val path: String, val size: Long, val takenAt: Long)
 
-    private fun key(d: Done) = "${d.path}|${d.size}|${d.takenAt}"
-
     @Synchronized
     fun isDone(path: String, size: Long, takenAt: Long): Boolean {
         if (size <= 0) return false
+        prune()
         return load().any { it.path == path && it.size == size && it.takenAt == takenAt }
     }
 
@@ -36,8 +35,39 @@ class TransferStore(ctx: Context) {
         val d = Done(path, size, takenAt)
         cur.removeAll { it.path == path }
         cur.add(d)
-        while (cur.size > MAX_HISTORY) cur.removeAt(0)
+        pruneInPlace(cur)
         save(cur)
+    }
+
+    /**
+     * Drop entries older than KEEP_DAYS (by phone wall-clock at save
+     * time, stored alongside) and cap the count. Pruning keeps the
+     * JSON small and isDone() O(n)-cheap.
+     */
+    private fun prune() {
+        val cur = load().toMutableList()
+        if (pruneInPlace(cur)) save(cur)
+    }
+
+    private fun pruneInPlace(cur: MutableList<Done>): Boolean {
+        val before = cur.size
+        val cutoffPhoto = System.currentTimeMillis() - KEEP_DAYS * 24L * 3600 * 1000
+        // takenAt is the photo's FAT time; entries with unknown or ancient
+        // photo dates still prune by insertion order (list tail = newest).
+        var changed = false
+        while (cur.size > MAX_HISTORY) {
+            cur.removeAt(0)
+            changed = true
+        }
+        // Also drop entries whose photo predates the window — re-download
+        // after 90 days is unsurprising and cheap to re-verify.
+        val kept = cur.filter { it.takenAt <= 0 || it.takenAt >= cutoffPhoto }
+        if (kept.size != cur.size) {
+            cur.clear()
+            cur.addAll(kept)
+            changed = true
+        }
+        return changed || cur.size != before
     }
 
     @Synchronized
@@ -107,5 +137,6 @@ class TransferStore(ctx: Context) {
         private const val KEY_DONE = "done_v1"
         private const val KEY_QUEUE = "queue_v1"
         private const val MAX_HISTORY = 5000
+        private const val KEEP_DAYS = 90L
     }
 }

@@ -106,8 +106,6 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-alpha17")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("io.coil-kt.coil3:coil-compose:3.5.0")
-    implementation("io.coil-kt.coil3:coil-network-okhttp:3.5.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("net.sf.kxml:kxml2:2.3.0")

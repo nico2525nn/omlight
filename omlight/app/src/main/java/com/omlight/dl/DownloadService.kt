@@ -136,19 +136,19 @@ class DownloadService : LifecycleService() {
                 refresh()
             }
             ACTION_RETRY_FAILED -> {
+                val paths = intent.getStringArrayExtra(EXTRA_PATHS) ?: emptyArray()
+                val sizes = intent.getLongArrayExtra(EXTRA_SIZES) ?: longArrayOf()
+                val taken = intent.getLongArrayExtra(EXTRA_TAKEN) ?: longArrayOf()
                 lifecycleScope.launch {
-                    val failed = _state.value.failed
-                    if (failed.isEmpty()) return@launch
-                    _state.update { it.copy(failed = emptyList()) }
-                    // Re-resolve sizes from the camera listing is the UI's
-                    // job; here we requeue with unknown size (verified
-                    // against Content-Length instead).
-                    for (p in failed) {
-                        val item = DlItem(p, 0L, 0L)
+                    _state.update { it.copy(failed = emptyList(), lastError = null) }
+                    var n = 0
+                    paths.forEachIndexed { i, p ->
+                        val item = DlItem(p, sizes.getOrElse(i) { 0L }, taken.getOrElse(i) { 0L })
                         pending.add(item)
                         queue.send(item)
+                        n++
                     }
-                    _state.update { it.copy(queued = it.queued + failed.size) }
+                    _state.update { it.copy(queued = it.queued + n) }
                     persistQueue()
                     refresh()
                 }
@@ -505,7 +505,7 @@ class DownloadService : LifecycleService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(R.drawable.ic_download)
             .setContentTitle("OMLight ダウンロード")
             .setContentText(text)
             .setContentIntent(open)
@@ -560,7 +560,8 @@ class DownloadService : LifecycleService() {
                 putExtra(EXTRA_TAKEN, items.map { it.takenAt }.toLongArray())
             }
             ContextCompat_startForegroundService(ctx, i)
-            _state.update { it.copy(queued = it.queued + items.size) }
+            // Count is updated by the service itself (post dedup skip);
+            // never touch it here or it double-counts.
         }
 
         fun pause(ctx: Context) {
@@ -575,9 +576,12 @@ class DownloadService : LifecycleService() {
             })
         }
 
-        fun retryFailed(ctx: Context) {
+        fun retryFailed(ctx: Context, items: List<DlItem>) {
             val i = Intent(ctx, DownloadService::class.java).apply {
                 action = ACTION_RETRY_FAILED
+                putExtra(EXTRA_PATHS, items.map { it.path }.toTypedArray())
+                putExtra(EXTRA_SIZES, items.map { it.sizeBytes }.toLongArray())
+                putExtra(EXTRA_TAKEN, items.map { it.takenAt }.toLongArray())
             }
             ContextCompat_startForegroundService(ctx, i)
         }

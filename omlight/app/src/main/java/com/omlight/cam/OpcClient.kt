@@ -70,9 +70,10 @@ class OpcClient(private val t: OpcTransport) {
         synchronized(lock) {
             if (mode == m) return
             val cgi = if (useCammode) "switch_cammode.cgi" else "switch_cameramode.cgi"
-            // Lvqty is only valid with rec on the new dialect.
+            // Lvqty is only valid with rec on the new dialect. Prefer the
+            // camera's advertised sizes; fall back to the 640 default.
             val body = if (m == Mode.REC && useCammode) {
-                t.getString(cgi, "mode" to m.wire, "lvqty" to DEFAULT_LVQTY)
+                t.getString(cgi, "mode" to m.wire, "lvqty" to pickLvqty())
             } else {
                 // Old dialect + standalone: "standalone". New dialect has no
                 // standalone; play is the idle mode.
@@ -82,6 +83,23 @@ class OpcClient(private val t: OpcTransport) {
             checkOk(body, "switch mode")
             mode = m
         }
+    }
+
+    /**
+     * Best liveview size the camera advertises. Prefers 640x480 (bandwidth
+     * sweet spot); falls back to the smallest advertised, then default.
+     */
+    fun pickLvqty(): String {
+        val sizes = info.commands["switch_cammode"].orEmpty()
+            .mapNotNull {
+                Regex("""lvqty=(\d+x\d+)""").find(it)?.groupValues?.get(1)
+            }
+            .distinct()
+        if (sizes.isEmpty()) return DEFAULT_LVQTY
+        if (DEFAULT_LVQTY in sizes) return DEFAULT_LVQTY
+        return sizes.minByOrNull {
+            it.split('x').let { p -> p[0].toInt() * p[1].toInt() }
+        } ?: DEFAULT_LVQTY
     }
 
     /** Best-effort return to idle; never throws (call on pause/disconnect). */
@@ -111,16 +129,18 @@ class OpcClient(private val t: OpcTransport) {
     /**
      * Start camera event notification (spec §5/§7). The camera opens [port]
      * and we connect back. Safe to call when already started.
+     * Port 0 = probe a free ephemeral port first.
      */
     @Throws(IOException::class)
-    fun startEvents(port: Int = DEFAULT_EVENT_PORT) {
+    fun startEvents(port: Int = 0) {
         synchronized(lock) {
             if (events?.running == true) return
-            t.getString("start_pushevent.cgi", "port" to port.toString())
+            val p = if (port > 0) port else freePort()
+            t.getString("start_pushevent.cgi", "port" to p.toString())
             val rx = EventReceiver(t.host)
-            rx.start(port)
+            rx.start(p)
             events = rx
-            eventPort = port
+            eventPort = p
         }
     }
 
@@ -314,14 +334,15 @@ class OpcClient(private val t: OpcTransport) {
     /**
      * Start RTP live view on [port]. Caller must have bound the UDP socket
      * first (spec §7). Returns after the camera ACKs; frames arrive async.
+     * Empty [lvqty] = auto-pick from the camera's advertised sizes.
      */
     @Throws(IOException::class)
-    fun startLiveview(port: Int, lvqty: String = DEFAULT_LVQTY) {
+    fun startLiveview(port: Int, lvqty: String = "") {
         setMode(Mode.REC)
         t.getString("exec_takemisc.cgi", "com" to "startliveview", "port" to port.toString())
         live.active = true
         live.port = port
-        live.lvqty = lvqty
+        live.lvqty = lvqty.ifEmpty { pickLvqty() }
     }
 
     @Throws(IOException::class)
@@ -518,10 +539,21 @@ class OpcClient(private val t: OpcTransport) {
 
     companion object {
         const val DEFAULT_LVQTY = "0640x0480"
-        /** TCP port the camera opens for event notification (spec §7 example). */
-        const val DEFAULT_EVENT_PORT = 65000
         /** Runaway guards for broken firmware listings. */
         const val MAX_DIRS = 512
         const val MAX_FILES = 20000
+
+        /**
+         * Find a free TCP port by binding port 0. TOCTOU-race safe
+         * enough here: the camera binds it within milliseconds, and
+         * startEvents fails loudly on collision so the session can retry.
+         */
+        private fun freePort(): Int {
+            try {
+                java.net.ServerSocket(0).use { return it.localPort }
+            } catch (_: IOException) {
+                return 65000 // spec §7 example as last resort
+            }
+        }
     }
 }

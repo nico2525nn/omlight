@@ -5,7 +5,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.omlight.cam.CamEntry
 import com.omlight.cam.CamProp
@@ -324,44 +323,64 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     missing.add(e)
                 }
             }
-            kotlinx.coroutines.sync.Semaphore(4).let { sem ->
-                val jobs = missing.map { e ->
-                    launch {
-                        sem.acquire()
-                        try {
-                            if (!isActive) return@launch
-                            val jpeg = c.thumbnail(e.path)
-                            thumbStore.put(e.path, e.sizeBytes, jpeg)
-                            thumbs[e.path] = jpeg
-                        } catch (_: Exception) {
-                            // Offline cell; user can retry via refresh.
-                        } finally {
-                            sem.release()
-                        }
+            fetchThumbs(c, missing)
+        }
+    }
+
+    /** Shared fetch worker: at most 4 concurrent camera requests. */
+    private val thumbSem = kotlinx.coroutines.sync.Semaphore(4)
+    private val thumbFetching = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private suspend fun fetchThumbs(c: OpcClient, list: List<CamEntry>) {
+        val jobs = list.map { e ->
+            viewModelScope.launch(Dispatchers.IO) {
+                thumbSem.acquire()
+                try {
+                    if (!thumbFetching.add(e.path)) return@launch
+                    try {
+                        if (thumbs.containsKey(e.path)) return@launch
+                        val jpeg = c.thumbnail(e.path)
+                        thumbStore.put(e.path, e.sizeBytes, jpeg)
+                        thumbs[e.path] = jpeg
+                    } finally {
+                        thumbFetching.remove(e.path)
                     }
+                } catch (_: Exception) {
+                    // Offline cell; user can retry via refresh.
+                } finally {
+                    thumbSem.release()
                 }
-                jobs.forEach { it.join() }
             }
         }
+        jobs.forEach { it.join() }
     }
 
     /**
      * Fetch one thumbnail on demand (grid scrolled it into view).
-     * Disk cache → memory → network, in that order.
+     * Disk cache → memory → network, in that order. Deduped against
+     * the prefetch worker so the same file is never fetched twice.
      */
     fun needThumb(entry: CamEntry) {
         if (thumbs.containsKey(entry.path)) return
+        if (!thumbFetching.add(entry.path)) return
         thumbStore.get(entry.path, entry.sizeBytes)?.let {
             thumbs[entry.path] = it
+            thumbFetching.remove(entry.path)
             return
         }
-        val c = client ?: return
+        val c = client ?: run { thumbFetching.remove(entry.path); return }
         viewModelScope.launch(Dispatchers.IO) {
+            thumbSem.acquire()
             try {
+                if (thumbs.containsKey(entry.path)) return@launch
                 val jpeg = c.thumbnail(entry.path)
                 thumbStore.put(entry.path, entry.sizeBytes, jpeg)
                 thumbs[entry.path] = jpeg
             } catch (_: Exception) { /* retry on next bind */ }
+            finally {
+                thumbSem.release()
+                thumbFetching.remove(entry.path)
+            }
         }
     }
 
@@ -375,7 +394,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         statusMsg = "${items.size}件をダウンロード開始（バックグラウンドで継続）"
     }
 
-    fun downloadAll() = download(entries.map { it.path })
+    fun retryFailed() {
+        val failed = DownloadService.state.value.failed.toSet()
+        if (failed.isEmpty()) return
+        val items = entries.filter { it.path in failed }
+            .map { DlItem(it.path, it.sizeBytes, it.takenAtMillis) }
+        // Entries may have refreshed away; fall back to path-only for those.
+        val resolved = items.map { it.path }.toSet()
+        val all = items + (failed - resolved).map { DlItem(it, 0L, 0L) }
+        DownloadService.retryFailed(getApplication(), all)
+    }
 
     // -- detail -------------------------------------------------------------------------
 
@@ -667,11 +695,18 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         liveJob?.cancel()
         eventJob?.cancel()
         reconnectJob?.cancel()
-        viewModelScope.launch(Dispatchers.IO) {
+        thumbJob?.cancel()
+        // Synchronous teardown: viewModelScope is cancelled right after
+        // onCleared returns, so launching here would never run.
+        // Best-effort with a short timeout; each op is one HTTP call.
+        val t = Thread({
             runCatching { client?.idle() }
             runCatching { transport?.close() }
             runCatching { camNet?.close() }
-        }
+        }, "omlight-teardown")
+        t.isDaemon = true
+        t.start()
+        runCatching { t.join(3_000) }
         super.onCleared()
     }
 }

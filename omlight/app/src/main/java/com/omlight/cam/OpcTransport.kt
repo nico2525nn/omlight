@@ -1,7 +1,6 @@
 package com.omlight.cam
 
 import android.net.Network
-import android.os.Build
 import java.io.Closeable
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -37,9 +36,7 @@ class OpcTransport(
     @Volatile private var ua: String = Opc.UA_SPEC
 
     private val socketFactory: SocketFactory? =
-        network?.let { net ->
-            if (Build.VERSION.SDK_INT >= 21) net.socketFactory else null
-        }
+        network?.socketFactory
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .apply {

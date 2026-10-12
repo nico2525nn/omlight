@@ -1,6 +1,8 @@
 package com.omlight.ui
 
 import android.graphics.BitmapFactory
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -169,7 +171,7 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
                     if (showProps) PropsSheet(vm, onClose = { showProps = false })
                 }
             }
-            DlBanner()
+            DlBanner(vm)
         }
     }
 }
@@ -180,6 +182,20 @@ private fun ConnectGate(vm: CamViewModel) {
     var showAp by remember { mutableStateOf(false) }
     var ssid by remember { mutableStateOf("") }
     var pass by remember { mutableStateOf("") }
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    // Nearby-wifi permission is requested only when the user actually
+    // tries the in-app AP join — never at app launch.
+    var pendingJoin by remember { mutableStateOf(false) }
+    val wifiPerm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && pendingJoin) {
+            pendingJoin = false
+            vm.connectAp(ssid.trim(), pass)
+        } else if (!granted) {
+            pendingJoin = false
+        }
+    }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -240,7 +256,22 @@ private fun ConnectGate(vm: CamViewModel) {
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
-                        onClick = { vm.connectAp(ssid.trim(), pass) },
+                        onClick = {
+                            val perm = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                                android.Manifest.permission.NEARBY_WIFI_DEVICES
+                            } else {
+                                android.Manifest.permission.ACCESS_FINE_LOCATION
+                            }
+                            if (androidx.core.content.ContextCompat.checkSelfPermission(
+                                    ctx, perm
+                                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                            ) {
+                                vm.connectAp(ssid.trim(), pass)
+                            } else {
+                                pendingJoin = true
+                                wifiPerm.launch(perm)
+                            }
+                        },
                         enabled = ssid.isNotBlank() && pass.length >= 8,
                     ) { Text("このWi-Fiに接続") }
                     TextButton(onClick = {
@@ -565,7 +596,7 @@ private fun ZoomHoldButton(label: String, dir: OpcClient.ZoomDir, vm: CamViewMod
 
 /** Slim progress banner pinned above the bottom bar while downloads run. */
 @Composable
-private fun DlBanner() {
+private fun DlBanner(vm: CamViewModel) {
     val s by DownloadService.state.collectAsState()
     val active = s.active
     if (active == null && s.queued == 0 && s.failed.isEmpty() && s.done == 0) return
@@ -598,7 +629,7 @@ private fun DlBanner() {
                         }
                     }
                     if (s.failed.isNotEmpty()) {
-                        TextButton(onClick = { DownloadService.retryFailed(ctx) }) {
+                        TextButton(onClick = vm::retryFailed) {
                             Text("再試行")
                         }
                     }

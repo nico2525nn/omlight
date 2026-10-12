@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- Transfer history/queue are device-local camera state; stale paths
+         from another phone would cause phantom skips. -->
+    <exclude domain="sharedpref" path="transfer.xml" />
+</full-backup-content>
