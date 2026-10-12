@@ -570,21 +570,6 @@ class OpcClient(private val t: OpcTransport) {
         }
     }
 
-    /** Jump zoom to [focalMm]. Best-effort: not all lenses support fix zoom. */
-    @Throws(IOException::class)
-    fun zoomTo(focalMm: Int) {
-        setMode(Mode.REC)
-        // Fix zoom exists only in the new dialect; shipping bodies without
-        // it throw, and callers treat that as "not supported".
-        checkOk(
-            t.getString(
-                "exec_takemisc.cgi", "com" to "newctrlzoom",
-                "ctrl" to "start", "dir" to "fix", "focallen" to focalMm.toString(),
-            ),
-            "zoom",
-        )
-    }
-
     // -- administration (playmaintenance mode) ---------------------------------------------
 
     /**
@@ -738,13 +723,6 @@ class OpcClient(private val t: OpcTransport) {
 
     // -- properties & state -------------------------------------------------------
 
-    @Throws(IOException::class)
-    fun camProp(name: String): CamProp? {
-        val m = ensureModeForProp()
-        val body = t.getString("get_camprop.cgi", "com" to "get", "propname" to name)
-        return OpcParse.camProp(body)?.copy(name = name).also { restoreMode(m) }
-    }
-
     /** Writable props + enums (rec mode). Empty when the camera lacks desclist. */
     @Throws(IOException::class)
     fun camPropList(): List<CamProp> {
@@ -771,9 +749,6 @@ class OpcClient(private val t: OpcTransport) {
             restoreMode(m)
         }
     }
-
-    @Throws(IOException::class)
-    fun state(): CameraState = OpcParse.camState(t.getString("get_state.cgi"))
 
     /**
      * Sync the camera clock to the phone (spec: set_utctimediff).

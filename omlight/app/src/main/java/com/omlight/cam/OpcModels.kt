@@ -19,8 +19,6 @@ object Opc {
      */
     const val UA_DEFAULT = "OI.Share v2"
     const val UA_SPEC = "OlympusCameraKit"
-
-    fun baseUrl(host: String = HOST) = "http://$host/"
 }
 
 /** One DCF file or directory entry from `get_imglist.cgi` (spec §6, text/plain). */

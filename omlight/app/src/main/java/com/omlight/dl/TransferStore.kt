@@ -158,6 +158,25 @@ class TransferStore(ctx: Context) {
         prefs.edit().remove(KEY_QUEUE).remove(KEY_ACTIVE).apply()
     }
 
+    /**
+     * Pending work summary for the "resume later" banner.
+     * Returns (item count, total bytes or -1 when unknown).
+     */
+    @Synchronized
+    fun pendingSummary(): Pair<Int, Long> {
+        val items = loadQueue().filterNot {
+            isDoneNoPrune(it.path, it.sizeBytes, it.takenAt)
+        }
+        if (items.isEmpty()) return 0 to -1
+        val bytes = items.sumOf { it.sizeBytes }
+        return items.size to if (bytes > 0) bytes else -1
+    }
+
+    private fun isDoneNoPrune(path: String, size: Long, takenAt: Long): Boolean {
+        if (size <= 0) return false
+        return load().any { it.path == path && it.size == size && it.takenAt == takenAt }
+    }
+
     // -- internals ---------------------------------------------------------------------
 
     private fun load(): List<Done> =

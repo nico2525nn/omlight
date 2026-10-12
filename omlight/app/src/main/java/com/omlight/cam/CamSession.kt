@@ -75,19 +75,25 @@ object CamSession {
             client?.let { return it }
             val n = CameraNetwork(app.applicationContext)
             net = n
-            val t = n.requestCameraAp(ssid, pass)
-                ?: run {
-                    refs--
-                    n.close()
-                    net = null
-                    throw IOException("APへの接続をキャンセルしたか、カメラが応答しません。")
-                }
-            transport = t
-            val c = OpcClient(t)
-            c.connect()
-            c.syncClock()
-            client = c
-            return c
+            try {
+                val t = n.requestCameraAp(ssid, pass)
+                    ?: throw IOException("APへの接続をキャンセルしたか、カメラが応答しません。")
+                transport = t
+                val c = OpcClient(t)
+                c.connect()
+                c.syncClock()
+                client = c
+                return c
+            } catch (e: Exception) {
+                // connect() (or the AP join) failed: unwind everything so
+                // the next acquire starts clean (no leaked ref/network).
+                refs--
+                runCatching { transport?.close() }
+                runCatching { n.close() }
+                net = null
+                transport = null
+                throw e
+            }
         }
     }
 

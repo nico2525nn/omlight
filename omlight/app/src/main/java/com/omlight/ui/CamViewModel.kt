@@ -165,6 +165,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var detailLoading: Boolean by mutableStateOf(false)
         private set
+    /** Movie length text for the detail sheet, null when n/a. */
+    var detailMovieLen: String? by mutableStateOf(null)
+        private set
     /** Writable camera props for the settings sheet. */
     var props: List<CamProp> by mutableStateOf(emptyList())
         private set
@@ -183,7 +186,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     private var holding = false
 
     /** Current shared client, or null when disconnected. */
-    private suspend fun client(): OpcClient? = CamSession.peek()
+    private suspend fun client(): OpcClient? =
+        CamSession.peek()?.also { lastClient = it }
 
     /** Camera card free space text, loaded with props. Null = unknown. */
     var cardFree: String? by mutableStateOf(null)
@@ -213,6 +217,61 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Paths verified present in MediaStore (refreshed on grid load). */
     var savedPaths: Set<String> by mutableStateOf(emptySet())
         private set
+    /** Interrupted download work from a previous run (count, bytes). */
+    var pendingResume: Pair<Int, Long>? by mutableStateOf(null)
+        private set
+
+    /** Check for resumable work (call on launch + on connect). */
+    fun checkResume() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val (n, b) = com.omlight.dl.TransferStore(getApplication()).pendingSummary()
+                // Only banner when the service isn't already running it.
+                pendingResume =
+                    if (n > 0 && com.omlight.dl.DownloadService.state.value.active == null &&
+                        com.omlight.dl.DownloadService.state.value.queued == 0
+                    ) n to b else null
+            } catch (_: Exception) { /* best-effort */ }
+        }
+    }
+
+    /** Resume interrupted downloads now. */
+    fun resumePending() {
+        pendingResume = null
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val items = com.omlight.dl.TransferStore(getApplication()).loadQueue()
+                if (items.isNotEmpty()) {
+                    com.omlight.dl.DownloadService.enqueue(getApplication(), items)
+                }
+            } catch (_: Exception) { /* best-effort */ }
+        }
+    }
+
+    /** Wipe the transfer history (saved badges clear too). */
+    fun clearHistory() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                com.omlight.dl.TransferStore(getApplication()).clearHistory()
+                savedPaths = emptySet()
+                statusMsg = "保存履歴をクリアしました"
+            } catch (_: Exception) { /* best-effort */ }
+        }
+    }
+
+    /** Discard interrupted downloads. */
+    fun discardPending() {
+        pendingResume = null
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                com.omlight.dl.TransferStore(getApplication()).clearQueue()
+                // Drop orphaned staging temps too.
+                getApplication<Application>().cacheDir.listFiles { f ->
+                    f.name.startsWith("dl_") && f.name.endsWith(".tmp")
+                }?.forEach { runCatching { it.delete() } }
+            } catch (_: Exception) { /* best-effort */ }
+        }
+    }
 
     /**
      * Reconcile history against MediaStore: a file the user deleted on
@@ -283,13 +342,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         ) {
             return "ローカルネットワークの許可が必要です。「接続」を押して許可してください。"
         }
-        val cm = app.getSystemService(android.net.ConnectivityManager::class.java)
         val wifiUp = try {
-            cm.allNetworks?.any {
-                cm.getNetworkCapabilities(it)?.hasTransport(
-                    android.net.NetworkCapabilities.TRANSPORT_WIFI
-                ) == true
-            } == true
+            com.omlight.cam.CameraNetwork(app).useDiag().wifiUp
         } catch (_: Exception) {
             false
         }
@@ -332,6 +386,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 diagText = null
                 startEventStream(c)
                 refresh()
+                checkResume()
             } catch (e: Exception) {
                 if (holding) {
                     withContext(Dispatchers.IO) { CamSession.release() }
@@ -566,11 +621,28 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Fetch one thumbnail on demand (grid scrolled it into view).
-     * Disk cache → memory → network, in that order. Deduped against
-     * the prefetch worker so the same file is never fetched twice.
-     * Skipped while liveview runs: thumbs need PLAY, LV owns REC.
+     * Warm thumbs for paths about to scroll in. Skips memory/disk hits
+     * and in-flight fetches; the shared semaphore caps concurrency.
      */
+    fun prefetchAhead(paths: List<String>) {
+        if (paths.isEmpty()) return
+        val byPath = entries.associateBy { it.path }
+        val targets = paths.mapNotNull { byPath[it] }
+            .filter { !thumbs.containsKey(it.path) }
+        if (targets.isEmpty()) return
+        val c = runBlockingPeek() ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            fetchThumbs(c, targets.take(24))
+        }
+    }
+
+    // Non-suspending peek for prefetch (best-effort; null = offline).
+    private var lastClient: OpcClient? = null
+
+    private fun runBlockingPeek(): OpcClient? {
+        lastClient?.let { return it }
+        return null
+    }
     fun needThumb(entry: CamEntry) {
         if (thumbs.containsKey(entry.path)) return
         if (!thumbFetching.add(entry.path)) return
@@ -626,12 +698,17 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     fun openDetail(path: String) {
         detailPath = path
         detailJpeg = null
+        detailMovieLen = null
         if (detailLoading) return
         viewModelScope.launch {
             val c = client() ?: return@launch
             detailLoading = true
             try {
                 detailJpeg = withContext(Dispatchers.IO) { c.preview(path) }
+                if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
+                    val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
+                    if (sec > 0) detailMovieLen = "%d:%02d".format(sec / 60, sec % 60)
+                }
                 noteSuccess()
             } catch (e: Exception) {
                 statusMsg = "プレビューの取得に失敗: ${e.message}"
@@ -849,7 +926,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     private fun startLive() {
         if (liveJob != null) return
         liveRunning = true
-        liveJob = viewModelScope.launch(Dispatchers.IO) {
+        val job = viewModelScope.launch(Dispatchers.IO) {
             val c = client() ?: return@launch
             try {
                 LiveviewReceiver(network = c.network).use { rx ->
@@ -890,6 +967,10 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 liveFrame = null
             }
         }
+        // Clear the handle on ANY exit (error/cancel/end) so a later
+        // startLive() never sees a dead job and refuses to start.
+        job.invokeOnCompletion { if (liveJob === job) liveJob = null }
+        liveJob = job
     }
 
     private fun stopLive() {

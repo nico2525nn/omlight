@@ -92,6 +92,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.omlight.cam.CamEntry
 import com.omlight.cam.OpcClient
@@ -421,6 +423,29 @@ private fun PhotosTab(vm: CamViewModel) {
                     )
                 }
             }
+            // Resume-later banner for interrupted downloads.
+            vm.pendingResume?.let { (n, bytes) ->
+                Card(
+                    Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    ),
+                ) {
+                    Row(
+                        Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "中断した保存が${n}件あります" +
+                                (if (bytes > 0) " (約${bytes / 1024 / 1024}MB)" else ""),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = vm::resumePending) { Text("再開") }
+                        TextButton(onClick = vm::discardPending) { Text("破棄") }
+                    }
+                }
+            }
             // Selection header (Photos style): × + count + select-all.
             if (selecting) {
                 Row(
@@ -468,9 +493,30 @@ private fun PhotosTab(vm: CamViewModel) {
                     }
                 }
             } else {
+                val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+                // Lookahead: when the user scrolls, prefetch thumbs just
+                // beyond the viewport so cells are warm on arrival.
+                LaunchedEffect(gridState.isScrollInProgress) {
+                    if (!gridState.isScrollInProgress) return@LaunchedEffect
+                    val layout = gridState.layoutInfo
+                    val last = layout.visibleItemsInfo.lastOrNull()?.index ?: return@LaunchedEffect
+                    // Map visible grid indices back to entries (headers
+                    // occupy indices too, so resolve via keys).
+                    val keys = layout.visibleItemsInfo.mapNotNull { it.key as? String }
+                    val paths = keys.filter { it.startsWith("/DCIM/") }
+                    val tail = paths.takeLast(6)
+                    if (tail.isNotEmpty()) vm.prefetchAhead(tail)
+                    // Also warm the next section's worth past the viewport.
+                    val flat = list.map { it.path }
+                    val anchor = flat.indexOf(paths.lastOrNull())
+                    if (anchor >= 0) {
+                        vm.prefetchAhead(flat.drop(anchor + 1).take(18))
+                    }
+                }
                 LazyVerticalGrid(
                     GridCells.Adaptive(120.dp),
                     Modifier.fillMaxSize(),
+                    state = gridState,
                     contentPadding = PaddingValues(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -570,6 +616,30 @@ private fun PhotosTab(vm: CamViewModel) {
 }
 
 @Composable
+private fun ThumbImage(
+    jpeg: ByteArray,
+    desc: String,
+    modifier: Modifier,
+    scale: ContentScale = ContentScale.Crop,
+) {
+    var bmp: ImageBitmap? by remember(jpeg) { mutableStateOf(null) }
+    LaunchedEffect(jpeg) {
+        bmp = withContext(Dispatchers.Default) {
+            runCatching {
+                BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
+            }.getOrNull()
+        }
+    }
+    if (bmp != null) {
+        androidx.compose.foundation.Image(
+            bmp!!, desc,
+            modifier,
+            contentScale = scale,
+        )
+    }
+}
+
+@Composable
 private fun PhotoCell(
     entry: CamEntry,
     jpeg: ByteArray?,
@@ -587,18 +657,7 @@ private fun PhotoCell(
     ) {
         Box(Modifier.fillMaxSize()) {
             if (jpeg != null) {
-                val bmp: ImageBitmap? = remember(jpeg) {
-                    runCatching {
-                        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
-                    }.getOrNull()
-                }
-                if (bmp != null) {
-                    androidx.compose.foundation.Image(
-                        bmp, entry.name,
-                        Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop,
-                    )
-                }
+                ThumbImage(jpeg, entry.name, Modifier.fillMaxSize())
             } else {
                 Box(
                     Modifier.fillMaxSize()
@@ -610,7 +669,7 @@ private fun PhotoCell(
             }
             if (entry.isMovie) {
                 Icon(
-                    Icons.Default.Movie, null,
+                    Icons.Default.Movie, "動画",
                     Modifier.align(Alignment.BottomStart).padding(4.dp),
                     tint = MaterialTheme.colorScheme.onPrimary,
                 )
@@ -674,6 +733,8 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
                 val label = if (vm.liveFrame != null) "liveview (tap to lock AF)"
                 else "撮影した写真"
                 if (jpeg != null) {
+                    // LV frames arrive ~4fps; skip the async hop for them
+                    // (small + already validated). Detail/preview use async.
                     val bmp: ImageBitmap? = remember(jpeg) {
                         runCatching {
                             BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
@@ -939,6 +1000,13 @@ private fun DetailSheet(vm: CamViewModel) {
     ModalBottomSheet(onDismissRequest = vm::closeDetail, sheetState = sheet) {
         Column(Modifier.padding(16.dp)) {
             Text(path.substringAfterLast('/'), style = MaterialTheme.typography.titleMedium)
+            vm.detailMovieLen?.let {
+                Text(
+                    "動画 $it",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Spacer(Modifier.height(8.dp))
             Box(
                 Modifier.fillMaxWidth().aspectRatio(4f / 3f)
@@ -948,18 +1016,7 @@ private fun DetailSheet(vm: CamViewModel) {
             ) {
                 val jpeg = vm.detailJpeg
                 if (jpeg != null) {
-                    val bmp: ImageBitmap? = remember(jpeg) {
-                        runCatching {
-                            BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
-                        }.getOrNull()
-                    }
-                    if (bmp != null) {
-                        androidx.compose.foundation.Image(
-                            bmp, path,
-                            Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Fit,
-                        )
-                    }
+                    ThumbImage(jpeg, path, Modifier.fillMaxSize(), ContentScale.Fit)
                 } else {
                     CircularProgressIndicator()
                 }
@@ -1038,9 +1095,14 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                     TextButton(onClick = { confirmPower = false }) { Text("やめる") }
                 }
             } else {
-                TextButton(onClick = { confirmPower = true }) {
-                    Icon(Icons.Default.PowerSettingsNew, null)
-                    Text("カメラの電源を切る")
+                Row {
+                    TextButton(onClick = { confirmPower = true }) {
+                        Icon(Icons.Default.PowerSettingsNew, null)
+                        Text("カメラの電源を切る")
+                    }
+                    TextButton(onClick = vm::clearHistory) {
+                        Text("保存履歴をクリア")
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))

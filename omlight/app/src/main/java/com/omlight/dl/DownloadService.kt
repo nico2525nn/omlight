@@ -83,6 +83,18 @@ class DownloadService : LifecycleService() {
         store = TransferStore(this)
         ensureChannel()
         startForegroundCompat(progressNotification("準備中…", 0, 0, true))
+        // Drop staging temps older than a week (crashed runs that will
+        // never resume: camera files rotate, Range offsets go stale).
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val cutoff = System.currentTimeMillis() - 7L * 24 * 3600 * 1000
+                cacheDir.listFiles { f ->
+                    f.name.startsWith("dl_") && f.name.endsWith(".tmp")
+                }?.forEach { f ->
+                    if (f.lastModified() < cutoff) runCatching { f.delete() }
+                }
+            } catch (_: Exception) { /* best-effort */ }
+        }
         worker = lifecycleScope.launch { drain() }
     }
 
@@ -596,9 +608,16 @@ class DownloadService : LifecycleService() {
         queue.close()
         if (holding) {
             holding = false
-            // Release async: onDestroy can't suspend. The session mutex
-            // is uncontended here (worker already cancelled).
-            lifecycleScope.launch { runCatching { CamSession.release() } }
+            // Synchronous release on a daemon thread: lifecycleScope is
+            // being torn down, so a launch{} here might never run.
+            val t = Thread({
+                try {
+                    kotlinx.coroutines.runBlocking { CamSession.release() }
+                } catch (_: Exception) { /* best-effort */ }
+            }, "omlight-svc-release")
+            t.isDaemon = true
+            t.start()
+            runCatching { t.join(3_000) }
         }
         super.onDestroy()
     }
