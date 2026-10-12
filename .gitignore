@@ -1,0 +1,30 @@
+# Gradle / Android
+.gradle/
+build/
+*/build/
+local.properties
+*.iml
+.idea/
+!idea/codeStyles/
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+*.keystore
+*.jks
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# APK outputs (build artifacts; release APK attached per-release instead)
+*.apk
+*.aab
+
+# Original vendor APK (not part of this clean-room project)
+com.omdigitalsolutions.oishare_v157.apk
