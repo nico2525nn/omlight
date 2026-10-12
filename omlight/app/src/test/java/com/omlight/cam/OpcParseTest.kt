@@ -63,6 +63,15 @@ class OpcParseTest {
     }
 
     @Test
+    fun xmlFlat_parsesBareConnectmode() {
+        // Real E-M5 II: no <response> wrapper.
+        val m = OpcParse.xmlFlat(
+            "<?xml version=\"1.0\"?>\n<connectmode>private</connectmode>"
+        )
+        assertEquals("private", m["connectmode"])
+    }
+
+    @Test
     fun xmlFlat_parsesEventRoot() {
         // Push-event body uses <root> instead of <response>; same depth.
         val m = OpcParse.xmlFlat(
@@ -113,6 +122,25 @@ class OpcParseTest {
 
     @Test
     fun commandList_extractsModes() {
+        // Real E-M5 II shape: cmd1/param1, cgi name without .cgi.
+        val cmds = OpcParse.commandList(
+            "<oishare><cgi name=\"switch_cammode\">" +
+                "<http_method type=\"get\"><cmd1 name=\"mode\">" +
+                "<param1 name=\"rec\"><cmd2 name=\"lvqty\">" +
+                "<param2 name=\"0640x0480\"/>" +
+                "</cmd2></param1><param1 name=\"play\"/>" +
+                "</cmd1></http_method></cgi></oishare>"
+        )
+        val info = CameraInfo(model = "x", commands = cmds)
+        assertTrue(info.supports("switch_cammode"))
+        assertTrue(info.supportsArg("switch_cammode", "mode", "rec"))
+        assertTrue(info.supportsArg("switch_cammode", "lvqty", "0640x0480"))
+        assertFalse(info.supportsArg("switch_cammode", "mode", "shutter"))
+    }
+
+    @Test
+    fun commandList_acceptsLegacyShape() {
+        // AIR-era draft shape still parses.
         val cmds = OpcParse.commandList(
             "<response><cgi name=\"switch_cammode.cgi\">" +
                 "<http_method type=\"get\"><cmd name=\"mode\">" +
@@ -120,8 +148,6 @@ class OpcParseTest {
                 "</cmd></http_method></cgi></response>"
         )
         val info = CameraInfo(model = "x", commands = cmds)
-        assertTrue(info.supports("switch_cammode"))
         assertTrue(info.supportsArg("switch_cammode", "mode", "rec"))
-        assertFalse(info.supportsArg("switch_cammode", "mode", "shutter"))
     }
 }

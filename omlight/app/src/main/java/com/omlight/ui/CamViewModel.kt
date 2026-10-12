@@ -53,6 +53,62 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             val f = filterDate ?: return entries
             return entries.filter { dayOf(it.takenAtMillis) == f }
         }
+
+    /**
+     * Google-Photos-style sections: [(day, items)] newest-first.
+     * Unknown-date files trail in a "" section rendered as その他.
+     */
+    val sections: List<Pair<String, List<CamEntry>>>
+        get() {
+            val list = visibleEntries
+            if (list.isEmpty()) return emptyList()
+            val out = ArrayList<Pair<String, List<CamEntry>>>()
+            var curDay: String? = null
+            var cur = ArrayList<CamEntry>()
+            fun flush() {
+                if (cur.isNotEmpty() && curDay != null) {
+                    out.add(curDay!! to cur.toList())
+                    cur = ArrayList()
+                }
+            }
+            for (e in list) {
+                val d = dayOf(e.takenAtMillis)
+                if (d != curDay) {
+                    flush()
+                    curDay = d
+                }
+                cur.add(e)
+            }
+            flush()
+            return out
+        }
+
+    /** Pretty day label: 今日/昨日 or M月d日(曜). */
+    fun dayLabel(day: String): String {
+        if (day.isEmpty()) return "日付不明"
+        return try {
+            val p = day.split('-')
+            val c = java.util.Calendar.getInstance()
+            val today = "%04d-%02d-%02d".format(
+                c.get(java.util.Calendar.YEAR),
+                c.get(java.util.Calendar.MONTH) + 1,
+                c.get(java.util.Calendar.DAY_OF_MONTH),
+            )
+            if (day == today) return "今日"
+            c.add(java.util.Calendar.DAY_OF_MONTH, -1)
+            val yest = "%04d-%02d-%02d".format(
+                c.get(java.util.Calendar.YEAR),
+                c.get(java.util.Calendar.MONTH) + 1,
+                c.get(java.util.Calendar.DAY_OF_MONTH),
+            )
+            if (day == yest) return "昨日"
+            val w = arrayOf("日", "月", "火", "水", "木", "金", "土")
+            c.set(p[0].toInt(), p[1].toInt() - 1, p[2].toInt())
+            "${p[1].toInt()}月${p[2].toInt()}日(${w[c.get(java.util.Calendar.DAY_OF_WEEK) - 1]})"
+        } catch (_: Exception) {
+            day
+        }
+    }
     /** Distinct shoot days present, newest-first, for the filter chips. */
     val shootDays: List<String>
         get() = entries.mapNotNull {
@@ -93,6 +149,15 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Last capture event text for the shoot tab (AF ok, capturing…). */
     var captureState: String? by mutableStateOf(null)
         private set
+    /** Just-taken photo preview (recview/getlastjpg) shown after a shot. */
+    var lastShot: ByteArray? by mutableStateOf(null)
+        private set
+    /** AF lock point as 0..1 fractions, null when none. */
+    var afPoint: Pair<Float, Float>? by mutableStateOf(null)
+        private set
+    /** True while the shoot tab is visible (drives auto-liveview). */
+    var shootVisible: Boolean by mutableStateOf(false)
+        private set
     /** Full-size preview for the detail sheet, path -> JPEG. */
     var detailJpeg: ByteArray? by mutableStateOf(null)
         private set
@@ -120,10 +185,126 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Current shared client, or null when disconnected. */
     private suspend fun client(): OpcClient? = CamSession.peek()
 
+    /** Camera card free space text, loaded with props. Null = unknown. */
+    var cardFree: String? by mutableStateOf(null)
+        private set
+
+    /** Remote power-off (with UI disconnect after). */
+    fun powerOff() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            try {
+                withContext(Dispatchers.IO) { c.powerOff() }
+            } catch (_: Exception) { /* AP dies with it */ }
+            statusMsg = "カメラの電源を切りました"
+            disconnect()
+        }
+    }
+
+    /** Last connection diagnosis, shown on the gate after a failure. */
+    var diagText: String? by mutableStateOf(null)
+        private set
+    /** False when the body lacks delete/protect (E-M5 II hides the buttons). */
+    var adminSupported: Boolean by mutableStateOf(true)
+        private set
+    /** True on share-limited One-Time connections: banner the restriction. */
+    var oneTime: Boolean by mutableStateOf(false)
+        private set
+    /** Paths verified present in MediaStore (refreshed on grid load). */
+    var savedPaths: Set<String> by mutableStateOf(emptySet())
+        private set
+
+    /**
+     * Reconcile history against MediaStore: a file the user deleted on
+     * the phone stops counting as saved (and becomes downloadable again).
+     * Runs off the UI thread; matching is by display name + size within
+     * our OMLight folders.
+     */
+    fun reconcileSaved() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val app = getApplication<Application>()
+                val store = com.omlight.dl.TransferStore(app)
+                val hist = store.history()
+                if (hist.isEmpty()) {
+                    savedPaths = emptySet()
+                    return@launch
+                }
+                val resolver = app.contentResolver
+                val found = HashSet<String>()
+                for (coll in listOf(
+                    android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    android.provider.MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                )) {
+                    resolver.query(
+                        coll,
+                        arrayOf(
+                            android.provider.MediaStore.MediaColumns.DISPLAY_NAME,
+                            android.provider.MediaStore.MediaColumns.SIZE,
+                        ),
+                        "${android.provider.MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                        arrayOf("%OMLight%"),
+                        null,
+                    )?.use { cur ->
+                        val ni = cur.getColumnIndexOrThrow(
+                            android.provider.MediaStore.MediaColumns.DISPLAY_NAME
+                        )
+                        val si = cur.getColumnIndexOrThrow(
+                            android.provider.MediaStore.MediaColumns.SIZE
+                        )
+                        val rows = HashSet<Pair<String, Long>>()
+                        while (cur.moveToNext()) {
+                            rows.add(cur.getString(ni) to cur.getLong(si))
+                        }
+                        for (h in hist) {
+                            val name = h.path.substringAfterLast('/')
+                            if (rows.contains(name to h.size)) found.add(h.path)
+                        }
+                    }
+                }
+                savedPaths = found
+            } catch (_: Exception) { /* best-effort */ }
+        }
+    }
+
     // -- connection ---------------------------------------------------------------
+
+    /**
+     * Preflight: returns a user-facing blocker message, or null when
+     * connection can proceed. Checks (in order): local-network permission
+     * (17+), any Wi-Fi up, VPN warning (non-blocking, sets statusMsg).
+     */
+    private fun preflight(): String? {
+        val app = getApplication<Application>()
+        if (android.os.Build.VERSION.SDK_INT >= 37 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                app, "android.permission.ACCESS_LOCAL_NETWORK"
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            return "ローカルネットワークの許可が必要です。「接続」を押して許可してください。"
+        }
+        val cm = app.getSystemService(android.net.ConnectivityManager::class.java)
+        val wifiUp = try {
+            cm.allNetworks?.any {
+                cm.getNetworkCapabilities(it)?.hasTransport(
+                    android.net.NetworkCapabilities.TRANSPORT_WIFI
+                ) == true
+            } == true
+        } catch (_: Exception) {
+            false
+        }
+        if (!wifiUp) {
+            return "Wi-FiがOFFか、カメラのWi-Fiに未接続です。設定でカメラのSSIDに接続してください。"
+        }
+        return null
+    }
 
     fun connect() {
         if (conn == Conn.Searching) return
+        preflight()?.let {
+            conn = Conn.Failed(it)
+            return
+        }
         viewModelScope.launch {
             conn = Conn.Searching
             statusMsg = null
@@ -134,6 +315,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 holding = true
                 val model = c.info.model.ifEmpty { "OPC camera" }
                 conn = Conn.Ready(model)
+                adminSupported = c.supportsAdmin()
+                oneTime = c.isOneTime()
                 failures = 0
                 linkDown = false
                 val net = CamSession.network()
@@ -146,12 +329,27 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                         statusMsg = "カメラのWi-Fiが切れました。再接続してください"
                     }
                 }
+                diagText = null
                 startEventStream(c)
                 refresh()
             } catch (e: Exception) {
                 if (holding) {
                     withContext(Dispatchers.IO) { CamSession.release() }
                     holding = false
+                }
+                // Diagnose for the gate: SSID/permissions/networks tell the
+                // user (and us) exactly which layer failed.
+                diagText = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val d = com.omlight.cam.CameraNetwork(getApplication()).useDiag()
+                        buildString {
+                            append("Wi-Fi: ")
+                            append(d.ssid ?: if (d.wifiUp) "(SSID不明)" else "未接続")
+                            append(" / ネット数: ${d.totalNets}")
+                            if (!d.lnpGranted) append(" / ローカルNW未許可")
+                            if (d.vpnActive) append(" / VPN有効")
+                        }
+                    }.getOrNull()
                 }
                 conn = Conn.Failed(e.message ?: "接続エラー")
             }
@@ -280,11 +478,24 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refresh() {
         if (refreshing) return
+        if (liveRunning) return // listing needs PLAY; LV owns REC
         viewModelScope.launch {
             val c = client() ?: return@launch
             refreshing = true
             try {
-                val list = withContext(Dispatchers.IO) { c.allImages() }
+                val list = withContext(Dispatchers.IO) {
+                    val all = c.allImages()
+                    // One-Time: also merge the share-reserved list, which
+                    // is the only thing visible there. Dedupe by path.
+                    if (c.isOneTime()) {
+                        val rsv = c.reserveList()
+                        (all + rsv).distinctBy { it.path }
+                            .sortedWith(
+                                compareByDescending<CamEntry> { it.takenAtMillis }
+                                    .thenByDescending { it.path }
+                            )
+                    } else all
+                }
                 entries = list
                 emptyHint = if (list.isEmpty()) {
                     "カメラの一覧は空でした。カメラ側で「ワンタイム接続」や" +
@@ -293,6 +504,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 thumbs.keys.retainAll(list.map { it.path }.toSet())
                 prefetchThumbs(list.take(60))
                 noteSuccess()
+                reconcileSaved()
             } catch (e: Exception) {
                 statusMsg = "一覧の更新に失敗: ${e.message}"
                 noteFailure("一覧の更新")
@@ -320,6 +532,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     missing.add(e)
                 }
             }
+            if (liveRunning) return@launch // LV owns REC; network fetch waits
             fetchThumbs(c, missing)
         }
     }
@@ -356,12 +569,18 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
      * Fetch one thumbnail on demand (grid scrolled it into view).
      * Disk cache → memory → network, in that order. Deduped against
      * the prefetch worker so the same file is never fetched twice.
+     * Skipped while liveview runs: thumbs need PLAY, LV owns REC.
      */
     fun needThumb(entry: CamEntry) {
         if (thumbs.containsKey(entry.path)) return
         if (!thumbFetching.add(entry.path)) return
         thumbStore.get(entry.path, entry.sizeBytes)?.let {
             thumbs[entry.path] = it
+            thumbFetching.remove(entry.path)
+            return
+        }
+        if (liveRunning) {
+            // Defer: retry on next bind (tab switch re-binds all).
             thumbFetching.remove(entry.path)
             return
         }
@@ -472,21 +691,48 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val c = client() ?: return@launch
             shooting = true
-            captureState = "撮影中…"
+            captureState = "ピント合わせ…"
+            // Liveview holds REC + the RTP stream; stop it so the shutter
+            // handshake gets a quiet bus. Restarted after, if visible.
+            val wasLive = liveRunning
+            if (wasLive) stopLive()
             try {
                 withContext(Dispatchers.IO) { c.takePicture() }
-                statusMsg = "撮影しました"
+                captureState = "保存中…"
                 noteSuccess()
-                // Event CAPTURE_DONE also refreshes; this is the fallback.
+                // Pull the just-taken preview so the tab shows *something*.
+                // getlastjpg works even when the body is still writing.
+                lastShot = try {
+                    withContext(Dispatchers.IO) { c.recview() }
+                } catch (_: Exception) {
+                    null
+                }
+                statusMsg = "撮影しました"
                 delay(800)
                 refresh()
             } catch (e: Exception) {
-                statusMsg = "撮影に失敗: ${e.message}"
+                statusMsg = "撮影に失敗: ${shootWhy(e)}"
                 noteFailure("撮影")
             } finally {
                 shooting = false
                 captureState = null
+                if (wasLive && shootVisible) startLive()
             }
+        }
+    }
+
+    /** Human cause for a shoot failure (timeout vs AF vs busy). */
+    private fun shootWhy(e: Exception): String {
+        val m = e.message.orEmpty()
+        return when {
+            m.contains("ピント", ignoreCase = true) || m.contains("affocus", ignoreCase = true) ->
+                "ピントが合いませんでした。明るい所・近い被写体で試してください"
+            m.contains("timeout", ignoreCase = true) || m.contains("timed out", ignoreCase = true) ->
+                "カメラが応答しません。カメラの電源・Wi-Fiを確認してください"
+            m.contains("503", ignoreCase = true) || m.contains("busy", ignoreCase = true) ->
+                "カメラが書き込み中です。少し待って再試行してください"
+            m.contains("カメラエラー", ignoreCase = true) -> m
+            else -> e.message ?: "不明なエラー"
         }
     }
 
@@ -525,6 +771,42 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             m.groupValues[1].toInt() to m.groupValues[2].toInt()
         } else {
             640 to 480
+        }
+    }
+
+    /**
+     * Lock AF at the tapped liveview point (assignafframe) without
+     * shooting. Tap again to release. Falls back to shootAt on bodies
+     * without AF-frame commands.
+     */
+    fun toggleAf(fx: Float, fy: Float) {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            if (afPoint != null) {
+                withContext(Dispatchers.IO) { c.releaseAf() }
+                afPoint = null
+                return@launch
+            }
+            val (w, h) = liveviewSize(c)
+            val x = (fx.coerceIn(0f, 1f) * (w - 1)).toInt()
+            val y = (fy.coerceIn(0f, 1f) * (h - 1)).toInt()
+            val ok = withContext(Dispatchers.IO) { c.assignAf(x, y) }
+            if (ok) {
+                afPoint = fx to fy
+                statusMsg = "AFロックしました (もう一度タップで解除)"
+            } else {
+                // No AF-frame support: treat as focus-and-shoot instead.
+                shootAt(fx, fy)
+            }
+        }
+    }
+
+    fun onShootVisible(v: Boolean) {
+        shootVisible = v
+        if (v && conn is Conn.Ready && !liveRunning && liveJob == null) {
+            startLive()
+        } else if (!v) {
+            stopLive()
         }
     }
 
@@ -573,12 +855,29 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 LiveviewReceiver(network = c.network).use { rx ->
                     withContext(Dispatchers.IO) { c.startLiveview(rx.port) }
                     try {
+                        var frames = 0
+                        var nulls = 0
+                        var lastLog = System.currentTimeMillis()
                         while (isActive) {
-                            val jpeg = rx.nextFrame() ?: continue
-                            // Validate cheaply: BitmapFactory bounds decode.
-                            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                            BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
-                            if (opts.outWidth > 0) liveFrame = jpeg
+                            val jpeg = rx.nextFrame()
+                            if (jpeg == null) {
+                                nulls++
+                            } else {
+                                // Validate cheaply: BitmapFactory bounds decode.
+                                val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
+                                if (opts.outWidth > 0) {
+                                    liveFrame = jpeg
+                                    frames++
+                                }
+                            }
+                            val now = System.currentTimeMillis()
+                            if (now - lastLog > 10_000) {
+                                android.util.Log.i(
+                                    "OMLight", "liveview stats: frames=$frames nulls=$nulls port=${rx.port}"
+                                )
+                                lastLog = now
+                            }
                         }
                     } finally {
                         runCatching { c.stopLiveview() }
@@ -612,6 +911,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             propsLoading = true
             try {
                 props = withContext(Dispatchers.IO) { c.camPropList() }
+                val free = withContext(Dispatchers.IO) { c.freeBytes() }
+                cardFree = if (free >= 0) formatBytes(free) else null
                 if (props.isEmpty()) statusMsg = "このカメラは設定一覧に対応していません"
                 noteSuccess()
             } catch (e: Exception) {
@@ -681,6 +982,14 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearStatus() {
         statusMsg = null
+    }
+
+    private fun formatBytes(b: Long): String = when {
+        b < 0 -> "不明"
+        b < 1024 -> "$b B"
+        b < 1024 * 1024 -> "${b / 1024} KB"
+        b < 1024 * 1024 * 1024 -> "%.1f MB".format(b / 1024.0 / 1024.0)
+        else -> "%.1f GB".format(b / 1024.0 / 1024.0 / 1024.0)
     }
 
     override fun onCleared() {

@@ -94,6 +94,7 @@ configurations.all {
         // M3 1.4.0 wants compose 1.11.2; cache has 1.11.4. Align up.
         force(
             "org.jetbrains.kotlin:kotlin-stdlib:2.2.10",
+            "androidx.appcompat:appcompat:1.7.0",
             "androidx.compose.ui:ui:1.11.4",
             "androidx.compose.ui:ui-text:1.11.4",
             "androidx.compose.ui:ui-util:1.11.4",
@@ -125,6 +126,10 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.5.0-alpha17")
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // QR scan (WIFI: credentials): Play-services Code Scanner.
+    // The scan UI + decode live in GMS (OS-side), so the APK barely grows.
+    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("net.sf.kxml:kxml2:2.3.0")

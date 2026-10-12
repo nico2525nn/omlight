@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -26,15 +27,21 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.IndeterminateCheckBox
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Wifi
@@ -48,6 +55,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
@@ -162,9 +170,12 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
                 Conn.Idle, is Conn.Failed -> ConnectGate(vm)
                 Conn.Searching -> Searching()
                 is Conn.Ready -> {
+                    LaunchedEffect(tab) {
+                        vm.onShootVisible(tab == 1)
+                    }
                     when (tab) {
                         0 -> PhotosTab(vm)
-                        else -> ShootTab(vm)
+                        else -> ShootTab(vm, onSeePhotos = { tab = 0 })
                     }
                     if (vm.linkDown) LinkDownBanner(vm)
                     DetailSheet(vm)
@@ -196,6 +207,32 @@ private fun ConnectGate(vm: CamViewModel) {
             pendingJoin = false
         }
     }
+    // Local-network permission (Android 17+): without it the OS blocks
+    // ALL LAN sockets and the camera is unreachable. Request inline as
+    // part of pressing Connect — the failure mode otherwise is a
+    // confusing "camera not found".
+    var pendingConnect by remember { mutableStateOf(false) }
+    val lnpPerm = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // Granted or not, try: denial surfaces as a clear error below.
+        if (pendingConnect) {
+            pendingConnect = false
+            vm.connect()
+        }
+    }
+    fun doConnect() {
+        if (android.os.Build.VERSION.SDK_INT >= 37 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                ctx, "android.permission.ACCESS_LOCAL_NETWORK"
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingConnect = true
+            lnpPerm.launch("android.permission.ACCESS_LOCAL_NETWORK")
+        } else {
+            vm.connect()
+        }
+    }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -212,9 +249,17 @@ private fun ConnectGate(vm: CamViewModel) {
         if (failed != null) {
             Spacer(Modifier.height(8.dp))
             Text(failed, color = MaterialTheme.colorScheme.error)
+            vm.diagText?.let {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         Spacer(Modifier.height(24.dp))
-        Button(onClick = vm::connect) { Text("接続") }
+        Button(onClick = ::doConnect) { Text("接続") }
         Spacer(Modifier.height(8.dp))
         // In-app AP join (Android 10+). Needs nearby-wifi/location permission,
         // requested on first use by the activity.
@@ -241,6 +286,7 @@ private fun ConnectGate(vm: CamViewModel) {
                 // Paste a WIFI: payload scanned by the system camera.
                 var qr by remember { mutableStateOf("") }
                 var qrErr by remember { mutableStateOf<String?>(null) }
+                var showQr by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     qr, {
                         qr = it
@@ -252,6 +298,35 @@ private fun ConnectGate(vm: CamViewModel) {
                 )
                 qrErr?.let {
                     Text(it, color = MaterialTheme.colorScheme.error)
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { showQr = true }) { Text("スキャン") }
+                    TextButton(onClick = {
+                        val cred = com.omlight.cam.WifiQr.parse(qr)
+                        if (cred == null) {
+                            qrErr = "WIFI:形式として読めませんでした"
+                        } else {
+                            ssid = cred.ssid
+                            pass = cred.pass
+                            qr = ""
+                        }
+                    }) { Text("QRを反映") }
+                }
+                if (showQr) {
+                    QrScanTrigger(
+                        start = true,
+                        onScanned = { text ->
+                            val cred = com.omlight.cam.WifiQr.parse(text)
+                            if (cred == null) {
+                                qrErr = "Wi-FiのQRではありませんでした"
+                            } else {
+                                ssid = cred.ssid
+                                pass = cred.pass
+                            }
+                        },
+                        onDone = { showQr = false },
+                    )
                 }
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -274,16 +349,6 @@ private fun ConnectGate(vm: CamViewModel) {
                         },
                         enabled = ssid.isNotBlank() && pass.length >= 8,
                     ) { Text("このWi-Fiに接続") }
-                    TextButton(onClick = {
-                        val cred = com.omlight.cam.WifiQr.parse(qr)
-                        if (cred == null) {
-                            qrErr = "WIFI:形式として読めませんでした"
-                        } else {
-                            ssid = cred.ssid
-                            pass = cred.pass
-                            qr = ""
-                        }
-                    }) { Text("QRを反映") }
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -313,33 +378,73 @@ private fun PhotosTab(vm: CamViewModel) {
     var selecting by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<String>()) }
     val list = vm.visibleEntries
+    val sections = vm.sections
+
+    fun toggle(path: String) {
+        selected = if (path in selected) selected - path else selected + path
+        if (selected.isEmpty()) selecting = false
+    }
+
+    fun selectDay(day: String, paths: List<String>) {
+        selecting = true
+        val unsaved = paths.filter { it !in vm.savedPaths }
+        val sel = selected
+        selected = when {
+            // Step 1: nothing (of this day) selected -> unsaved only.
+            paths.none { it in sel } && unsaved.isNotEmpty() -> sel + unsaved
+            // Step 2: unsaved selected -> whole day.
+            unsaved.isNotEmpty() && unsaved.all { it in sel } &&
+                paths.any { it !in sel } -> sel + paths
+            // Step 3: whole day (or mixed) selected -> clear day.
+            else -> {
+                val next = sel - paths.toSet()
+                if (next.isEmpty()) selecting = false
+                next
+            }
+        }
+    }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            // Date filter chips (horizontal, newest-first).
-            if (vm.shootDays.size > 1) {
-                androidx.compose.foundation.lazy.LazyRow(
-                    contentPadding = PaddingValues(horizontal = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+            // One-Time restriction banner.
+            if (vm.oneTime) {
+                Card(
+                    Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+                    colors = androidx.compose.material3.CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    ),
                 ) {
-                    item {
-                        FilterChip(
-                            selected = vm.filterDate == null,
-                            onClick = { vm.selectFilterDate(null) },
-                            label = { Text("すべて") },
-                        )
-                    }
-                    items(vm.shootDays.size) { i ->
-                        val day = vm.shootDays[i]
-                        FilterChip(
-                            selected = vm.filterDate == day,
-                            onClick = {
-                                vm.selectFilterDate(if (vm.filterDate == day) null else day)
-                            },
-                            label = { Text(day.substring(5)) },
-                        )
+                    Text(
+                        "ワンタイム接続: シェア予約された写真のみ表示されます",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(8.dp),
+                    )
+                }
+            }
+            // Selection header (Photos style): × + count + select-all.
+            if (selecting) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = {
+                        selecting = false
+                        selected = emptySet()
+                    }) { Icon(Icons.Default.Close, "選択を閉じる") }
+                    Text(
+                        "${selected.size}件選択中",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = {
+                        selected = if (selected.size == list.size) emptySet()
+                        else list.map { it.path }.toSet()
+                        if (selected.isEmpty()) selecting = false
+                    }) {
+                        Text(if (selected.size == list.size) "解除" else "すべて選択")
                     }
                 }
+                HorizontalDivider()
             }
             PullToRefreshBox(vm.refreshing, onRefresh = vm::refresh, Modifier.weight(1f).fillMaxWidth()) {
             if (list.isEmpty() && !vm.refreshing) {
@@ -370,34 +475,60 @@ private fun PhotosTab(vm: CamViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    items(list, key = { it.path }) { e ->
-                        androidx.compose.runtime.LaunchedEffect(e.path) {
-                            vm.needThumb(e)
-                        }
-                        PhotoCell(
-                            entry = e,
-                            jpeg = vm.thumbFor(e.path),
-                            selected = e.path in selected,
-                            selecting = selecting,
-                            onTap = {
-                                if (selecting) {
-                                    selected = if (e.path in selected) selected - e.path
-                                    else selected + e.path
-                                } else {
-                                    vm.openDetail(e.path)
+                    for ((day, items) in sections) {
+                        item(key = "hdr-$day", span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
+                            // Day header: label + round check toggle (Photos style).
+                            val allSel = items.all { it.path in selected }
+                            val someSel = !allSel && items.any { it.path in selected }
+                            Row(
+                                Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    vm.dayLabel(day),
+                                    style = MaterialTheme.typography.titleSmall,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(onClick = {
+                                    selectDay(day, items.map { it.path })
+                                }) {
+                                    SelectRing(
+                                        state = when {
+                                            allSel -> 2
+                                            someSel -> 1
+                                            else -> 0
+                                        },
+                                        desc = "この日を選択",
+                                    )
                                 }
-                            },
-                            onLongPress = {
-                                selecting = true
-                                selected = selected + e.path
-                            },
-                        )
+                            }
+                        }
+                        items(items, key = { it.path }) { e ->
+                            androidx.compose.runtime.LaunchedEffect(e.path) {
+                                vm.needThumb(e)
+                            }
+                            PhotoCell(
+                                entry = e,
+                                jpeg = vm.thumbFor(e.path),
+                                selected = e.path in selected,
+                                selecting = selecting,
+                                saved = e.path in vm.savedPaths && e.path !in selected,
+                                onTap = {
+                                    if (selecting) toggle(e.path)
+                                    else vm.openDetail(e.path)
+                                },
+                                onLongPress = {
+                                    selecting = true
+                                    selected = selected + e.path
+                                },
+                            )
+                        }
                     }
                 }
             }
             }
         }
-        // Action row: refresh + download-all when idle; selection actions when selecting.
+        // Bottom actions.
         Row(
             Modifier.align(Alignment.BottomCenter).padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -412,14 +543,26 @@ private fun PhotosTab(vm: CamViewModel) {
                     icon = { Icon(Icons.Default.CloudDownload, null) },
                     text = { Text("選択を保存 (${selected.size})") },
                 )
-                FloatingActionButton(onClick = { selecting = false; selected = emptySet() }) {
-                    Text("×")
-                }
             } else if (list.isNotEmpty()) {
+                val unsaved = list.filter { it.path !in vm.savedPaths }
                 ExtendedFloatingActionButton(
-                    onClick = { vm.download(list.map { it.path }) },
+                    onClick = {
+                        val targets = if (unsaved.isNotEmpty()) unsaved else list
+                        vm.download(targets.map { it.path })
+                    },
                     icon = { Icon(Icons.Default.CloudDownload, null) },
-                    text = { Text(if (vm.filterDate != null) "この日を保存" else "すべて保存") },
+                    text = {
+                        Text(
+                            when {
+                                vm.filterDate != null && unsaved.isNotEmpty() ->
+                                    "この日の未保存を保存 (${unsaved.size})"
+                                vm.filterDate != null -> "この日を保存"
+                                unsaved.isNotEmpty() && unsaved.size != list.size ->
+                                    "未保存を保存 (${unsaved.size})"
+                                else -> "すべて保存"
+                            }
+                        )
+                    },
                 )
             }
         }
@@ -432,6 +575,7 @@ private fun PhotoCell(
     jpeg: ByteArray?,
     selected: Boolean,
     selecting: Boolean,
+    saved: Boolean,
     onTap: () -> Unit,
     onLongPress: () -> Unit,
 ) {
@@ -471,13 +615,35 @@ private fun PhotoCell(
                     tint = MaterialTheme.colorScheme.onPrimary,
                 )
             }
+            // Saved badge: verified in MediaStore.
+            if (saved) {
+                Box(
+                    Modifier.align(Alignment.BottomEnd).padding(6.dp)
+                        .size(22.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Check, "保存済み",
+                        Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            }
+            // Selection check: hollow ring when idle, filled circle w/
+            // cutout check when selected (Photos style). Ring stays visible
+            // over any thumbnail via a scrim behind it.
             if (selecting) {
-                Icon(
-                    Icons.Default.CheckCircle, null,
-                    Modifier.align(Alignment.TopEnd).padding(4.dp),
-                    tint = if (selected) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Box(
+                    Modifier.align(Alignment.TopStart).padding(6.dp),
+                ) {
+                    SelectRing(
+                        state = if (selected) 2 else 0,
+                        desc = "選択",
+                        overImage = true,
+                    )
+                }
             }
         }
     }
@@ -485,39 +651,74 @@ private fun PhotoCell(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ShootTab(vm: CamViewModel) {
+private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
     Column(
         Modifier.fillMaxSize().padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        // Liveview frame or placeholder. Tap = focus-and-shoot at that point.
+        // Liveview frame, last shot, or placeholder.
+        // Tap liveview = AF lock at that point (tap again to release).
         Card(
             Modifier.fillMaxWidth().aspectRatio(4f / 3f)
                 .pointerInput(vm.liveFrame != null) {
                     detectTapGestures { off ->
                         if (vm.liveFrame != null && !vm.shooting) {
-                            vm.shootAt(off.x / size.width, off.y / size.height)
+                            vm.toggleAf(off.x / size.width, off.y / size.height)
                         }
                     }
                 },
         ) {
-            val jpeg = vm.liveFrame
-            if (jpeg != null) {
-                val bmp: ImageBitmap? = remember(jpeg) {
-                    runCatching {
-                        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
-                    }.getOrNull()
+            Box(Modifier.fillMaxSize()) {
+                // Liveview wins while running; else the just-taken shot.
+                val jpeg = vm.liveFrame ?: vm.lastShot
+                val label = if (vm.liveFrame != null) "liveview (tap to lock AF)"
+                else "撮影した写真"
+                if (jpeg != null) {
+                    val bmp: ImageBitmap? = remember(jpeg) {
+                        runCatching {
+                            BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
+                        }.getOrNull()
+                    }
+                    if (bmp != null) {
+                        androidx.compose.foundation.Image(
+                            bmp, label,
+                            Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                    }
+                } else {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(if (vm.liveRunning) "受信中…" else "ライブビュー停止中")
+                    }
                 }
-                if (bmp != null) {
-                    androidx.compose.foundation.Image(
-                        bmp, "liveview (tap to focus & shoot)",
-                        Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop,
-                    )
+                // AF lock marker, positioned by fraction.
+                vm.afPoint?.let { (fx, fy) ->
+                    androidx.compose.foundation.layout.BoxWithConstraints(
+                        Modifier.fillMaxSize()
+                    ) {
+                        val size = 44.dp
+                        val x = (maxWidth * fx - size / 2).coerceAtLeast(0.dp)
+                        val y = (maxHeight * fy - size / 2).coerceAtLeast(0.dp)
+                        Box(
+                            modifier = Modifier
+                                .padding(start = x, top = y)
+                                .size(size)
+                                .border(
+                                    2.dp, MaterialTheme.colorScheme.primary,
+                                    MaterialTheme.shapes.extraSmall,
+                                ),
+                        )
+                    }
                 }
-            } else {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(if (vm.liveRunning) "受信中…" else "ライブビュー停止中")
+                // Last-shot banner with a jump to Photos.
+                if (vm.liveFrame == null && vm.lastShot != null) {
+                    FilledTonalButton(
+                        onClick = onSeePhotos,
+                        modifier = Modifier.align(Alignment.BottomCenter).padding(8.dp),
+                    ) {
+                        Icon(Icons.Default.PhotoLibrary, null)
+                        Text("写真タブで見る")
+                    }
                 }
             }
         }
@@ -567,12 +768,52 @@ private fun ShootTab(vm: CamViewModel) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ZoomHoldButton("W", OpcClient.ZoomDir.WIDE, vm)
-            Button(onClick = vm::refresh, enabled = !vm.refreshing) {
-                Icon(Icons.Default.Refresh, null)
-                Text("更新")
-            }
+            // Quick settings: the 3 most-touched props inline.
+            QuickProp(vm, "expcomp", "露出")
             ZoomHoldButton("T", OpcClient.ZoomDir.TELE, vm)
         }
+        Spacer(Modifier.height(8.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            QuickProp(vm, "isospeedvalue", "ISO")
+            QuickProp(vm, "wbvalue", "WB")
+        }
+    }
+}
+
+/** Inline +/- stepper for one camera prop (loads props on demand). */
+@Composable
+private fun QuickProp(vm: CamViewModel, name: String, label: String) {
+    val prop = vm.props.firstOrNull { it.name == name }
+    LaunchedEffect(Unit) {
+        if (vm.props.isEmpty() && !vm.propsLoading) vm.loadProps()
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("$label ", style = MaterialTheme.typography.bodySmall)
+        val values = prop?.values.orEmpty()
+        val idx = values.indexOf(prop?.value)
+        FilledIconButton(
+            onClick = {
+                if (idx > 0) vm.setProp(name, values[idx - 1])
+            },
+            modifier = Modifier.size(40.dp),
+            enabled = prop?.writable == true && idx > 0,
+        ) { Text("−") }
+        Text(
+            prop?.value ?: "…",
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 4.dp),
+        )
+        FilledIconButton(
+            onClick = {
+                if (idx >= 0 && idx + 1 < values.size) vm.setProp(name, values[idx + 1])
+            },
+            modifier = Modifier.size(40.dp),
+            enabled = prop?.writable == true && idx >= 0 && idx + 1 < values.size,
+        ) { Text("＋") }
     }
 }
 
@@ -743,22 +984,25 @@ private fun DetailSheet(vm: CamViewModel) {
                         Icon(Icons.Default.CloudDownload, null)
                         Text("保存")
                     }
-                    TextButton(onClick = { vm.protectDetail(true) }) {
-                        Icon(Icons.Default.Lock, null)
-                        Text("保護")
-                    }
-                    TextButton(onClick = { vm.protectDetail(false) }) {
-                        Icon(Icons.Default.LockOpen, null)
-                        Text("解除")
-                    }
-                    TextButton(
-                        onClick = { confirmDelete = true },
-                        colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error,
-                        ),
-                    ) {
-                        Icon(Icons.Default.Delete, null)
-                        Text("削除")
+                    // Delete/protect exist only on some bodies (E-M5 II: no).
+                    if (vm.adminSupported) {
+                        TextButton(onClick = { vm.protectDetail(true) }) {
+                            Icon(Icons.Default.Lock, null)
+                            Text("保護")
+                        }
+                        TextButton(onClick = { vm.protectDetail(false) }) {
+                            Icon(Icons.Default.LockOpen, null)
+                            Text("解除")
+                        }
+                        TextButton(
+                            onClick = { confirmDelete = true },
+                            colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                                contentColor = MaterialTheme.colorScheme.error,
+                            ),
+                        ) {
+                            Icon(Icons.Default.Delete, null)
+                            Text("削除")
+                        }
                     }
                 }
             }
@@ -775,6 +1019,30 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onClose, sheetState = sheet) {
         Column(Modifier.padding(16.dp)) {
             Text("カメラ設定", style = MaterialTheme.typography.titleLarge)
+            vm.cardFree?.let {
+                Text(
+                    "カード空き: $it",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            var confirmPower by remember { mutableStateOf(false) }
+            if (confirmPower) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("カメラの電源を切りますか?", Modifier.weight(1f))
+                    TextButton(onClick = {
+                        confirmPower = false
+                        vm.powerOff()
+                        onClose()
+                    }) { Text("切る") }
+                    TextButton(onClick = { confirmPower = false }) { Text("やめる") }
+                }
+            } else {
+                TextButton(onClick = { confirmPower = true }) {
+                    Icon(Icons.Default.PowerSettingsNew, null)
+                    Text("カメラの電源を切る")
+                }
+            }
             Spacer(Modifier.height(8.dp))
             if (vm.propsLoading) {
                 Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
@@ -835,6 +1103,54 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                 }
             }
             Spacer(Modifier.height(24.dp))
+        }
+    }
+}
+
+/**
+ * Photos-style selection ring.
+ * state 0 = hollow ring only (no check), 1 = ring + dash (partial),
+ * 2 = filled circle with cutout check. [overImage] adds a scrim so the
+ * ring reads over any thumbnail.
+ */
+@Composable
+private fun SelectRing(state: Int, desc: String, overImage: Boolean = false) {
+    val filled = state == 2
+    Box(
+        Modifier
+            .size(26.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(
+                when {
+                    filled -> MaterialTheme.colorScheme.primary
+                    overImage -> MaterialTheme.colorScheme.scrim.copy(alpha = 0.45f)
+                    else -> androidx.compose.ui.graphics.Color.Transparent
+                }
+            )
+            .border(
+                2.dp,
+                when {
+                    filled -> MaterialTheme.colorScheme.primary
+                    overImage -> MaterialTheme.colorScheme.onPrimary
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                androidx.compose.foundation.shape.CircleShape,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        when (state) {
+            2 -> Icon(
+                Icons.Default.Check, desc,
+                Modifier.size(16.dp),
+                tint = MaterialTheme.colorScheme.onPrimary,
+            )
+            1 -> Icon(
+                Icons.Default.Remove, desc,
+                Modifier.size(16.dp),
+                tint = if (overImage) MaterialTheme.colorScheme.onPrimary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            // 0: bare ring, no glyph.
         }
     }
 }

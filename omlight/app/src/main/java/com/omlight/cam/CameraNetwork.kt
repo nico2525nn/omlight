@@ -43,6 +43,63 @@ class CameraNetwork(private val ctx: Context) : Closeable {
 
     private var callback: ConnectivityManager.NetworkCallback? = null
 
+    /** Snapshot of what the radio sees, for failure diagnosis UI. */
+    data class Diag(
+        val wifiUp: Boolean,
+        val ssid: String?,
+        val wifiNets: Int,
+        val totalNets: Int,
+        val vpnActive: Boolean,
+        val lnpGranted: Boolean,
+    )
+
+    fun diagnose(): Diag {
+        val all = try { cm.allNetworks?.toList().orEmpty() } catch (_: Exception) { emptyList() }
+        var wifi = 0
+        for (n in all) {
+            if (cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) {
+                wifi++
+            }
+        }
+        return Diag(
+            wifiUp = wifi > 0,
+            ssid = currentSsid(),
+            wifiNets = wifi,
+            totalNets = all.size,
+            vpnActive = vpnActive(),
+            lnpGranted = lnpGranted(),
+        )
+    }
+
+    /** Current Wi-Fi SSID, or null when invisible/permissionless. */
+    fun currentSsid(): String? {
+        return try {
+            val wm = ctx.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+                ?: return null
+            @Suppress("DEPRECATION")
+            val info = wm.connectionInfo ?: return null
+            val s = info.ssid?.trim('"') ?: return null
+            if (s.isEmpty() || s == "<unknown ssid>") null else s
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun lnpGranted(): Boolean {
+        if (Build.VERSION.SDK_INT < 37) return true
+        return ContextCompat.checkSelfPermission(ctx, "android.permission.ACCESS_LOCAL_NETWORK") ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    /** One-shot diagnosis without keeping the instance. */
+    fun useDiag(): Diag {
+        try {
+            return diagnose()
+        } finally {
+            runCatching { close() }
+        }
+    }
+
     /** True when some Wi-Fi transport is up (camera AP or otherwise). */
     fun wifiUp(): Boolean {
         val nets = cm.allNetworks ?: return false

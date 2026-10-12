@@ -84,7 +84,12 @@ object OpcParse {
     // -- text/xml responses ----------------------------------------------------
     // Small flat responses: <response><result>OK</result>...</response>.
 
-    /** First-level children of the root element as name -> text. */
+    /**
+     * First-level children of the root element as name -> text.
+     * Shipping bodies omit the `<response>` wrapper entirely
+     * (`<connectmode>private</connectmode>` at top level), so depth-1
+     * text elements are captured too.
+     */
     fun xmlFlat(body: String): Map<String, String> {
         val out = LinkedHashMap<String, String>()
         try {
@@ -93,20 +98,24 @@ object OpcParse {
             var event = p.eventType
             var depth = 0
             var key: String? = null
+            var keyDepth = 0
             while (event != XmlPullParser.END_DOCUMENT) {
                 when (event) {
                     XmlPullParser.START_TAG -> {
                         depth++
-                        if (depth == 2) key = p.name
+                        if (depth <= 2) {
+                            key = p.name
+                            keyDepth = depth
+                        }
                     }
                     XmlPullParser.TEXT -> {
-                        if (depth == 2 && key != null) {
+                        if (key != null && (keyDepth == 2 || (keyDepth == 1 && depth == 1))) {
                             val t = p.text.trim()
                             if (t.isNotEmpty()) out[key] = t
                         }
                     }
                     XmlPullParser.END_TAG -> {
-                        if (depth == 2) key = null
+                        if (depth == keyDepth) key = null
                         depth--
                     }
                 }
@@ -202,71 +211,136 @@ object OpcParse {
         )
     }
 
-    /** `get_commandlist.cgi`: command -> set of "arg=value" capability strings. */
-    fun commandList(body: String): Map<String, Set<String>> {
-        val cmds = LinkedHashMap<String, MutableSet<String>>()
+    /**
+     * `get_commandlist.cgi` -> structured [CapabilityDoc].
+     * Handles `<cmd1>/<param1>/<cmd2>/…` (shipping) and `<cmd>/<param>`
+     * (draft), cgi names with or without `.cgi`, and Shift-JIS bodies
+     * (XmlPullParser honors the XML encoding declaration).
+     */
+    fun capabilityDoc(body: String): CapabilityDoc {
+        var version = ""
+        val support = LinkedHashSet<String>()
+        val commands = LinkedHashMap<String, CommandCaps>()
         try {
             val p: XmlPullParser = newParser()
             p.setInput(body.reader())
-            var event = p.eventType
+            // Node stack for the current <cgi>: sealed on </cgi>.
             var cgi: String? = null
-            // Stack of (argName, value) pairs inside <cmd>/<param> nesting.
-            val stack = ArrayDeque<Pair<String, String?>>()
+            var method = HttpMethod.GET
+            // Each level: argName under construction + collected values.
+            data class Frame(val arg: String, val values: MutableList<Value>)
+            // param stack: value under construction + nested args.
+            data class PFrame(val value: String, val nested: MutableList<ArgTree>)
+            val argStack = ArrayDeque<Frame>()
+            val paramStack = ArrayDeque<PFrame>()
+            val topArgs = ArrayList<ArgTree>()
+            var inMethod = false
+
+            fun closeParam() {
+                if (paramStack.isEmpty()) return
+                val pf = paramStack.removeLast()
+                val v = Value(pf.value, pf.nested.toList())
+                if (argStack.isNotEmpty()) {
+                    argStack.last().values.add(v)
+                }
+            }
+
+            fun closeArg() {
+                if (argStack.isEmpty()) return
+                val f = argStack.removeLast()
+                val tree = ArgTree(f.arg, f.values.toList())
+                if (paramStack.isNotEmpty()) {
+                    paramStack.last().nested.add(tree)
+                } else {
+                    topArgs.add(tree)
+                }
+            }
+
+            var event = p.eventType
+            var textOf: String? = null // version text holder
             while (event != XmlPullParser.END_DOCUMENT) {
                 when (event) {
                     XmlPullParser.START_TAG -> {
-                        when (p.name) {
-                            "cgi" -> {
+                        val tag = p.name
+                        when {
+                            tag == "cgi" -> {
                                 cgi = p.getAttributeValue(null, "name")
                                     ?.removeSuffix(".cgi")
-                                if (cgi != null) {
-                                    cmds.getOrPut(cgi!!) { LinkedHashSet() }
-                                }
-                                stack.clear()
+                                method = HttpMethod.GET
+                                argStack.clear()
+                                paramStack.clear()
+                                topArgs.clear()
+                                inMethod = false
                             }
-                            "cmd", "param" -> {
-                                val n = p.getAttributeValue(null, "name")?.trim()
-                                if (n != null) {
-                                    // Parent with a concrete value forms "arg=value".
-                                    val parent = stack.lastOrNull()
-                                    if (cgi != null && parent != null &&
-                                        parent.second == null && parent.first.isNotEmpty()
-                                    ) {
-                                        cmds[cgi]?.add("${parent.first}=$n")
-                                    }
-                                    stack.addLast(n to null)
-                                } else {
-                                    stack.addLast("" to null)
+                            tag == "http_method" -> {
+                                inMethod = true
+                                val t = p.getAttributeValue(null, "type")
+                                method = if (t?.lowercase() == "post") HttpMethod.POST else HttpMethod.GET
+                            }
+                            tag == "version" -> textOf = "version"
+                            tag == "support" -> {
+                                p.getAttributeValue(null, "func")?.let { support.add(it) }
+                            }
+                            tag.startsWith("cmd") -> {
+                                if (cgi != null && inMethod) {
+                                    argStack.addLast(
+                                        Frame(p.getAttributeValue(null, "name")?.trim().orEmpty(), ArrayList())
+                                    )
                                 }
-                                // Value attribute directly on the tag.
-                                val v = p.getAttributeValue(null, "value")?.trim()
-                                if (v != null && cgi != null && n != null) {
-                                    cmds[cgi]?.add("$n=$v")
+                            }
+                            tag.startsWith("param") -> {
+                                if (cgi != null && inMethod) {
+                                    paramStack.addLast(
+                                        PFrame(p.getAttributeValue(null, "name")?.trim().orEmpty(), ArrayList())
+                                    )
                                 }
                             }
                         }
                     }
                     XmlPullParser.TEXT -> {
-                        val t = p.text.trim()
-                        if (t.isNotEmpty() && cgi != null) {
-                            val top = stack.lastOrNull()
-                            if (top != null && top.first.isNotEmpty()) {
-                                cmds[cgi]?.add("${top.first}=$t")
-                            }
+                        if (textOf == "version") {
+                            val t = p.text.trim()
+                            if (t.isNotEmpty()) version = t
                         }
                     }
                     XmlPullParser.END_TAG -> {
-                        when (p.name) {
-                            "cmd", "param" -> if (stack.isNotEmpty()) stack.removeLast()
-                            "cgi" -> { cgi = null; stack.clear() }
+                        val tag = p.name
+                        when {
+                            tag.startsWith("param") -> closeParam()
+                            tag.startsWith("cmd") -> closeArg()
+                            tag == "cgi" -> {
+                                // Flush unbalanced leftovers (tolerant).
+                                while (paramStack.isNotEmpty()) closeParam()
+                                while (argStack.isNotEmpty()) closeArg()
+                                if (cgi != null) {
+                                    commands[cgi!!] = CommandCaps(method, topArgs.toList())
+                                }
+                                cgi = null
+                            }
+                            tag == "version" -> textOf = null
                         }
                     }
                 }
                 event = p.next()
             }
         } catch (_: Exception) {
-            // Partial capability map still usable.
+            // Partial doc still usable.
         }
-        return cmds
+        return CapabilityDoc(version, support, commands)
+    }
+
+    /**
+     * `get_commandlist.cgi`: command -> set of "arg=value" capability strings.
+     *
+     * Legacy flat view over [capabilityDoc]. Kept for the small number of
+     * shallow checks; new code should query the AST.
+     */
+    fun commandList(body: String): Map<String, Set<String>> {
+        val doc = capabilityDoc(body)
+        return doc.commands.mapValues { (_, caps) ->
+            val out = LinkedHashSet<String>()
+            caps.args.forEach { it.collectPairs(out) }
+            out
+        }
     }
 }

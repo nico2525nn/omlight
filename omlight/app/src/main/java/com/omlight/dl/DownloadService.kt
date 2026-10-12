@@ -186,8 +186,8 @@ class DownloadService : LifecycleService() {
             store.setActive(item)
             try {
                 ensureClient()
-                downloadOne(item)
-                store.markDone(item.path, item.sizeBytes, item.takenAt)
+                val sha = downloadOne(item)
+                store.markDone(item.path, item.sizeBytes, item.takenAt, sha)
                 store.setActive(null)
                 _state.update { it.copy(done = it.done + 1, active = null) }
             } catch (e: Paused) {
@@ -251,12 +251,12 @@ class DownloadService : LifecycleService() {
         }
     }
 
-    private suspend fun downloadOne(item: DlItem) {
+    private suspend fun downloadOne(item: DlItem): String {
         _state.update {
             it.copy(active = item.path, activeBytes = 0L, activeTotal = item.sizeBytes)
         }
         refresh()
-        withContext(Dispatchers.IO) {
+        return withContext(Dispatchers.IO) {
             // Stage to a cache temp file first: allows Range resume and
             // post-download verification before anything hits MediaStore.
             // Name = hash of full identity (NOT the bare filename: two
@@ -271,9 +271,10 @@ class DownloadService : LifecycleService() {
             // Skip when the temp already holds the whole verified file
             // (previous run died between verify and MediaStore publish).
             if (item.sizeBytes > 0 && offset == item.sizeBytes && verifyHead(tmp, item.path)) {
+                val sha = sha256Of(tmp)
                 publish(tmp, item)
                 _state.update { it.copy(activeBytes = offset, activeTotal = item.sizeBytes) }
-                return@withContext
+                return@withContext sha
             }
             var attempt = 0
             var done = offset
@@ -359,11 +360,14 @@ class DownloadService : LifecycleService() {
                         tmp.delete()
                         throw IOException("downloaded file failed type check")
                     }
+                    val sha = sha256Of(tmp)
                     publish(tmp, item)
                     _state.update { it.copy(activeBytes = done, activeTotal = expect) }
-                    return@withContext
+                    return@withContext sha
                 }
             }
+            // Unreachable: the loop only exits via return or throw.
+            throw IOException("unreachable")
         }
     }
 
@@ -411,6 +415,27 @@ class DownloadService : LifecycleService() {
                 FileSniff.matches(path, head.copyOf(n))
         } catch (_: Exception) {
             false
+        }
+    }
+
+    /**
+     * SHA-256 of a staged file, hex. Computed once at publish; ~50ms/MB
+     * on modern phones, hidden inside the copy window.
+     */
+    private fun sha256Of(f: File): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            java.io.FileInputStream(f).use { ins ->
+                val buf = ByteArray(256 * 1024)
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    md.update(buf, 0, n)
+                }
+            }
+            md.digest().joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            ""
         }
     }
 

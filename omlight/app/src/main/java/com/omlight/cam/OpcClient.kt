@@ -20,6 +20,12 @@ class OpcClient(private val t: OpcTransport) {
 
     @Volatile var info: CameraInfo = CameraInfo(model = "")
         private set
+    /** Connection type from get_connectmode: private/onetime/OPC. */
+    @Volatile var connectionType: String = ""
+        private set
+    /** Detected wire dialect (re-detected on every connect). */
+    @Volatile var dialect: Dialect = Dialect.UNKNOWN
+        private set
     /** Camera network for binding aux sockets (events/liveview). */
     val network: android.net.Network? get() = t.network
     @Volatile private var useCammode = true // switch_cammode (new) vs switch_cameramode (AIR)
@@ -33,21 +39,32 @@ class OpcClient(private val t: OpcTransport) {
      */
     @Throws(IOException::class)
     fun connect() {
-        val cm = OpcParse.xmlFlat(t.getString("get_connectmode.cgi"))
-        if (cm["connectmode"] != "OPC") {
-            throw IOException("not an OPC camera (connectmode=${cm["connectmode"]})")
+        val cm = OpcParse.xmlFlat(t.handshakeGet("get_connectmode.cgi"))
+        // Spec says OPC; shipping bodies answer their connection type:
+        // "private" (full access) or "onetime" (share-order only).
+        // Anything non-empty means a camera answered.
+        val mode = cm["connectmode"].orEmpty()
+        if (mode.isEmpty()) {
+            throw IOException("not a camera (connectmode=$mode)")
         }
-        val cmds: Map<String, Set<String>> = try {
-            OpcParse.commandList(t.getString("get_commandlist.cgi"))
+        connectionType = mode
+        val doc: CapabilityDoc = try {
+            OpcParse.capabilityDoc(t.getString("get_commandlist.cgi"))
         } catch (_: IOException) {
-            emptyMap()
+            CapabilityDoc()
+        }
+        val cmds: Map<String, Set<String>> = doc.commands.mapValues { (_, caps) ->
+            val out = LinkedHashSet<String>()
+            caps.args.forEach { it.collectPairsPublic(out) }
+            out
         }
         val meta: CameraInfo = try {
             OpcParse.camInfo(t.getString("get_caminfo.cgi"))
         } catch (_: IOException) {
             CameraInfo(model = "")
         }
-        info = meta.copy(commands = cmds)
+        info = meta.copy(commands = cmds, caps = doc)
+        dialect = detectDialect(mode, doc)
         // Pin the mode-switch dialect.
         useCammode = when {
             cmds.containsKey("switch_cammode") -> true
@@ -55,6 +72,23 @@ class OpcClient(private val t: OpcTransport) {
             else -> probeDialect()
         }
         setMode(Mode.PLAY)
+    }
+
+    /**
+     * Pick the wire dialect. connectmode leads (private => PRIVATE);
+     * the take spelling confirms it. Unknown bodies stay UNKNOWN and
+     * probe per call.
+     */
+    private fun detectDialect(connectmode: String, doc: CapabilityDoc): Dialect {
+        val takeArgs = doc.pairs("exec_takemotion")
+        val hasStart = takeArgs.contains("com=starttake")
+        val hasNew = takeArgs.contains("com=newstarttake")
+        return when {
+            connectmode == "private" || hasStart -> Dialect.PRIVATE
+            connectmode == "OPC" || hasNew -> Dialect.AIR
+            doc.commands.isEmpty() -> Dialect.UNKNOWN
+            else -> Dialect.PRIVATE // shipping default: new bodies are private-like
+        }
     }
 
     private fun probeDialect(): Boolean {
@@ -71,6 +105,12 @@ class OpcClient(private val t: OpcTransport) {
     fun setMode(m: Mode) {
         synchronized(lock) {
             if (mode == m) return
+            // Liveview owns REC: a stray PLAY switch (thumbnail prefetch,
+            // props restore) would kill the RTP stream mid-frame. Callers
+            // that must leave REC stop liveview first.
+            if (live.active && m != Mode.REC) {
+                throw IOException("liveview active: stop it before leaving REC")
+            }
             val cgi = if (useCammode) "switch_cammode.cgi" else "switch_cameramode.cgi"
             // Lvqty is only valid with rec on the new dialect. Prefer the
             // camera's advertised sizes; fall back to the 640 default.
@@ -132,13 +172,16 @@ class OpcClient(private val t: OpcTransport) {
      * Start camera event notification (spec §5/§7). The camera opens [port]
      * and we connect back. Safe to call when already started.
      * Port 0 = probe a free ephemeral port first.
+     * No-op on bodies without push events (E-M5 II): returns silently.
      */
     @Throws(IOException::class)
     fun startEvents(port: Int = 0) {
+        if (!supportsEvents() && info.commands.isNotEmpty()) return
         synchronized(lock) {
             if (events?.running == true) return
             val p = if (port > 0) port else freePort()
-            t.getString("start_pushevent.cgi", "port" to p.toString())
+            val ack = t.getString("start_pushevent.cgi", "port" to p.toString())
+            if (OpcParse.xmlFlat(ack)["errorcode"] != null) return // declined
             val rx = EventReceiver(t.host, t.network)
             rx.start(p)
             events = rx
@@ -273,6 +316,28 @@ class OpcClient(private val t: OpcTransport) {
         return ok
     }
 
+    /**
+     * takemotion subcommand for a single shot. Dialect-led:
+     * PRIVATE => starttake, AIR => newstarttake, UNKNOWN => pinned probe.
+     */
+    private fun takeCom(): String = when (dialect) {
+        Dialect.PRIVATE -> "starttake"
+        Dialect.AIR -> "newstarttake"
+        Dialect.UNKNOWN -> takeComCache ?: "starttake"
+    }
+
+    private var takeComCache: String? = null
+
+    /** Movie subcommands, same dialect split as [takeCom]. */
+    private fun movieCom(start: Boolean): String {
+        val modern = takeCom() == "starttake"
+        return if (start) {
+            if (modern) "startmovietake" else "newstartmovietake"
+        } else {
+            if (modern) "stopmovietake" else "newstopmovietake"
+        }
+    }
+
     /** Single shot. Uses shutter-mode dialect when usable, else rec+takemotion. */
     @Throws(IOException::class)
     fun takePicture() {
@@ -280,7 +345,37 @@ class OpcClient(private val t: OpcTransport) {
             shutterTake()
         } else {
             setMode(Mode.REC)
-            checkOk(t.getString("exec_takemotion.cgi", "com" to "newstarttake"), "take")
+            takeWithFallback(null)
+        }
+    }
+
+    /**
+     * Run the take command, falling back to the other dialect spelling
+     * once on failure. Pins the winner for this session.
+     */
+    @Throws(IOException::class)
+    private fun takeWithFallback(point: String?) {
+        val first = takeCom()
+        val second = if (first == "starttake") "newstarttake" else "starttake"
+        try {
+            takeOnce(first, point)
+            takeComCache = first
+        } catch (e: IOException) {
+            if (info.commands.isNotEmpty()) throw e // advertised: trust it
+            takeOnce(second, point)
+            takeComCache = second
+        }
+    }
+
+    @Throws(IOException::class)
+    private fun takeOnce(com: String, point: String?) {
+        if (point == null) {
+            checkOk(t.getString("exec_takemotion.cgi", "com" to com), "take")
+        } else {
+            checkOk(
+                t.getString("exec_takemotion.cgi", "com" to com, "point" to point),
+                "take@point",
+            )
         }
     }
 
@@ -299,10 +394,7 @@ class OpcClient(private val t: OpcTransport) {
         }
         setMode(Mode.REC)
         val point = "%04dx%04d".format(x.coerceIn(0, 9999), y.coerceIn(0, 9999))
-        checkOk(
-            t.getString("exec_takemotion.cgi", "com" to "newstarttake", "point" to point),
-            "take@point",
-        )
+        takeWithFallback(point)
     }
 
     private var shutterCache: Boolean? = null
@@ -316,9 +408,24 @@ class OpcClient(private val t: OpcTransport) {
             mode = null
         }
         try {
-            checkOk(t.getString("exec_shutter.cgi", "com" to "1st2ndpush"), "shutter")
-            Thread.sleep(400)
-            checkOk(t.getString("exec_shutter.cgi", "com" to "2nd1strelease"), "shutter")
+            // Full two-stage sequence like the physical button:
+            // half-press (AF) -> full-press (capture) -> release both.
+            // Single 1st2ndpush alone doesn't fire on E-M5 II.
+            try {
+                checkOk(t.getString("exec_shutter.cgi", "com" to "1stpush"), "focus")
+                Thread.sleep(1200)
+            } catch (_: IOException) {
+                // Best-effort: some modes reject lone 1stpush.
+                Thread.sleep(400)
+            }
+            checkOk(t.getString("exec_shutter.cgi", "com" to "2ndpush"), "shutter")
+            Thread.sleep(600)
+            try {
+                checkOk(t.getString("exec_shutter.cgi", "com" to "2ndrelease"), "release")
+            } catch (_: IOException) { /* best-effort */ }
+            try {
+                checkOk(t.getString("exec_shutter.cgi", "com" to "1strelease"), "release")
+            } catch (_: IOException) { /* best-effort */ }
         } finally {
             setMode(Mode.PLAY)
         }
@@ -328,8 +435,7 @@ class OpcClient(private val t: OpcTransport) {
     @Throws(IOException::class)
     fun movieRecord(start: Boolean) {
         setMode(Mode.REC)
-        val com = if (start) "newstartmovietake" else "newstopmovietake"
-        checkOk(t.getString("exec_takemotion.cgi", "com" to com), "movie")
+        checkOk(t.getString("exec_takemotion.cgi", "com" to movieCom(start)), "movie")
     }
 
     // -- live view ---------------------------------------------------------------
@@ -382,15 +488,44 @@ class OpcClient(private val t: OpcTransport) {
     /** Preview (recview) JPEG right after a shot. */
     @Throws(IOException::class)
     fun recview(): ByteArray {
-        t.get("exec_takemisc.cgi", "com" to "getrecview").use { r ->
-            if (!r.isSuccessful) throw OpcTransport.statusError(r, "recview")
-            return r.body!!.bytes()
+        // Shipping bodies: getrecview, else getlastjpg (E-M5 II has both).
+        val coms = if (info.commands.isEmpty()) {
+            listOf("getrecview", "getlastjpg")
+        } else {
+            val args = info.commands["exec_takemisc"].orEmpty()
+            listOf("getrecview", "getlastjpg").filter { args.contains("com=$it") }
+                .ifEmpty { listOf("getrecview", "getlastjpg") }
         }
+        var lastErr: IOException? = null
+        for (com in coms) {
+            try {
+                t.get("exec_takemisc.cgi", "com" to com).use { r ->
+                    if (r.isSuccessful) return r.body!!.bytes()
+                    lastErr = OpcTransport.statusError(r, "recview")
+                }
+            } catch (e: IOException) {
+                lastErr = e
+            }
+        }
+        throw lastErr ?: IOException("recview unavailable")
     }
 
     // -- optical zoom ------------------------------------------------------------------
+    // Two dialects: shipping bodies use exec_takemisc com=ctrlzoom&move=
+    // (E-M5 II verified); the AIR-era draft used com=newctrlzoom. Detected
+    // from the command list.
 
     enum class ZoomDir(val wire: String) { TELE("tele"), WIDE("wide") }
+
+    private fun zoomDialectNew(): Boolean = when (dialect) {
+        Dialect.AIR -> true
+        Dialect.PRIVATE -> false
+        Dialect.UNKNOWN -> {
+            // No command list: trust the AST when partially known.
+            val args = info.commands["exec_takemisc"].orEmpty()
+            args.contains("com=newctrlzoom")
+        }
+    }
 
     /**
      * Drive optical zoom while held (spec §7 Drive Optical Zoom).
@@ -400,30 +535,47 @@ class OpcClient(private val t: OpcTransport) {
     @Throws(IOException::class)
     fun zoomStart(dir: ZoomDir) {
         setMode(Mode.REC)
-        checkOk(
-            t.getString(
-                "exec_takemisc.cgi", "com" to "newctrlzoom",
-                "ctrl" to "start", "dir" to dir.wire, "method" to "contnormal",
-            ),
-            "zoom",
-        )
+        if (zoomDialectNew()) {
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "newctrlzoom",
+                    "ctrl" to "start", "dir" to dir.wire, "method" to "contnormal",
+                ),
+                "zoom",
+            )
+        } else {
+            val move = if (dir == ZoomDir.TELE) "telemove" else "widemove"
+            checkOk(
+                t.getString("exec_takemisc.cgi", "com" to "ctrlzoom", "move" to move),
+                "zoom",
+            )
+        }
     }
 
     @Throws(IOException::class)
     fun zoomStop(dir: ZoomDir) {
-        checkOk(
-            t.getString(
-                "exec_takemisc.cgi", "com" to "newctrlzoom",
-                "ctrl" to "stop", "dir" to dir.wire,
-            ),
-            "zoom",
-        )
+        if (zoomDialectNew()) {
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "newctrlzoom",
+                    "ctrl" to "stop", "dir" to dir.wire,
+                ),
+                "zoom",
+            )
+        } else {
+            checkOk(
+                t.getString("exec_takemisc.cgi", "com" to "ctrlzoom", "move" to "off"),
+                "zoom",
+            )
+        }
     }
 
     /** Jump zoom to [focalMm]. Best-effort: not all lenses support fix zoom. */
     @Throws(IOException::class)
     fun zoomTo(focalMm: Int) {
         setMode(Mode.REC)
+        // Fix zoom exists only in the new dialect; shipping bodies without
+        // it throw, and callers treat that as "not supported".
         checkOk(
             t.getString(
                 "exec_takemisc.cgi", "com" to "newctrlzoom",
@@ -457,17 +609,131 @@ class OpcClient(private val t: OpcTransport) {
 
     /** Delete one file. Returns false when the camera refuses. */
     @Throws(IOException::class)
-    fun delete(path: String): Boolean = inAdmin {
-        val m = OpcParse.xmlFlat(t.getString("exec_erase.cgi", "DIR" to path))
-        m["result"] != "NG"
+    fun delete(path: String): Boolean {
+        if (!info.supports("exec_erase")) {
+            throw IOException("このカメラはアプリからの削除に対応していません")
+        }
+        return inAdmin {
+            val m = OpcParse.xmlFlat(t.getString("exec_erase.cgi", "DIR" to path))
+            m["errorcode"] == null && m["result"] != "NG"
+        }
     }
 
     /** Protect/unprotect one file. Returns false when the camera refuses. */
     @Throws(IOException::class)
-    fun protect(path: String, on: Boolean): Boolean = inAdmin {
-        val com = if (on) "set" else "release"
-        val m = OpcParse.xmlFlat(t.getString("exec_protect.cgi", "com" to com, "DIR" to path))
-        m["result"] != "NG"
+    fun protect(path: String, on: Boolean): Boolean {
+        if (!info.supports("exec_protect")) {
+            throw IOException("このカメラはアプリからの保護に対応していません")
+        }
+        return inAdmin {
+            val com = if (on) "set" else "release"
+            val m = OpcParse.xmlFlat(t.getString("exec_protect.cgi", "com" to com, "DIR" to path))
+            m["errorcode"] == null && m["result"] != "NG"
+        }
+    }
+
+    /** False on bodies without delete/protect commands (E-M5 II). UI hides the buttons. */
+    fun supportsAdmin(): Boolean =
+        info.commands.isEmpty() ||
+            (info.supports("exec_erase") && info.supports("exec_protect"))
+
+    /** False on bodies without push events (E-M5 II). Skips start_pushevent entirely. */
+    fun supportsEvents(): Boolean =
+        info.commands.isEmpty() || info.supports("start_pushevent")
+
+    // -- share-order / One-Time ------------------------------------------------------------
+
+    /**
+     * Share-reserved image list (One-Time connections only show these).
+     * Same VER_100 text shape as get_imglist. Empty when unsupported.
+     */
+    @Throws(IOException::class)
+    fun reserveList(): List<CamEntry> {
+        if (info.commands.isNotEmpty() && !info.supports("get_rsvimglist")) {
+            return emptyList()
+        }
+        return try {
+            OpcParse.imgList(t.getString("get_rsvimglist.cgi"))
+        } catch (_: IOException) {
+            emptyList()
+        }
+    }
+
+    /** True when this looks like a One-Time (share-limited) connection. */
+    fun isOneTime(): Boolean = connectionType.equals("onetime", ignoreCase = true)
+
+    // -- AF frame -------------------------------------------------------------------------------
+
+    /**
+     * Point AF to the liveview coordinate and lock it there
+     * (assignafframe). [x]/[y] in current lvqty space. Best-effort:
+     * returns false when the body lacks the command.
+     */
+    fun assignAf(x: Int, y: Int): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemotion", "com", "assignafframe")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            val point = "%04dx%04d".format(x.coerceIn(0, 9999), y.coerceIn(0, 9999))
+            checkOk(
+                t.getString("exec_takemotion.cgi", "com" to "assignafframe", "point" to point),
+                "af",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Release a locked AF frame. Best-effort. */
+    fun releaseAf(): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemotion", "com", "releaseafframe")
+        ) return false
+        return try {
+            checkOk(
+                t.getString("exec_takemotion.cgi", "com" to "releaseafframe"),
+                "af",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    // -- power & capacity ----------------------------------------------------------------------------
+
+    /** Remote power-off. The Wi-Fi AP dies with it; UI must disconnect. */
+    @Throws(IOException::class)
+    fun powerOff() {
+        // 202 Accepted, empty body. Never throws on transport quirks —
+        // the AP vanishes mid-response on some bodies.
+        try {
+            t.get("exec_pwoff.cgi").close()
+        } catch (_: IOException) { /* expected on some bodies */ }
+    }
+
+    /** Free bytes on the camera card (get_unusedcapacity), -1 when unknown. */
+    fun freeBytes(): Long {
+        if (info.commands.isNotEmpty() && !info.supports("get_unusedcapacity")) return -1
+        return try {
+            val m = OpcParse.xmlFlat(t.getString("get_unusedcapacity.cgi"))
+            m.values.firstNotNullOfOrNull { it.toLongOrNull() } ?: -1
+        } catch (_: IOException) {
+            -1
+        }
+    }
+
+    /** Movie play time in seconds for [path] (get_movplaytime), -1 when unknown. */
+    fun movieSeconds(path: String): Int {
+        if (info.commands.isNotEmpty() && !info.supports("get_movplaytime")) return -1
+        return try {
+            val m = OpcParse.xmlFlat(t.getString("get_movplaytime.cgi", "DIR" to path))
+            m.values.firstNotNullOfOrNull { it.toIntOrNull() } ?: -1
+        } catch (_: IOException) {
+            -1
+        }
     }
 
     // -- properties & state -------------------------------------------------------
@@ -549,9 +815,23 @@ class OpcClient(private val t: OpcTransport) {
     }
 
     private fun checkOk(body: String, what: String) {
+        if (body.isBlank()) return // empty body = old firmware ACK
         val m = OpcParse.xmlFlat(body)
+        // Shipping error shape: <errorcode>NNNN</errorcode>.
+        m["errorcode"]?.let { throw IOException("$what: カメラエラー $it") }
+        // Take result shape: <take>ok|ng</take>.
+        m["take"]?.let {
+            if (it != "ok") {
+                val af = m["affocus"]
+                throw IOException(
+                    "$what: 撮影できませんでした" +
+                        (if (af == "ng") "(ピントが合いません)" else "")
+                )
+            }
+            return
+        }
         val r = m["result"]
-        // Empty body = old firmware ACK. Missing result with no error = OK.
+        // Missing result with no error = OK.
         if (r != null && r != "OK") throw IOException("$what failed: $body")
     }
 

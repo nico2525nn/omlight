@@ -19,6 +19,9 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
         android:usesPermissionFlags="neverForLocation" />
+    <!-- QR scanner for camera Wi-Fi credentials. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <!-- Android 17+: local-network access. Ignored on older releases;
          with targetSdk 36 the grant is implicit, this is forward cover. -->
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />

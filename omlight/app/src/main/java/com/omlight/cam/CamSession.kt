@@ -33,17 +33,36 @@ object CamSession {
             client?.let { return it }
             val n = CameraNetwork(app.applicationContext)
             net = n
-            val t = n.findCamera(BuildConfig.CAM_HOST, BuildConfig.CAM_PORT)
-                ?: run {
-                    refs--
-                    n.close()
-                    net = null
-                    throw IOException("カメラが見つかりません")
-                }
+            val t = try {
+                n.findCamera(BuildConfig.CAM_HOST, BuildConfig.CAM_PORT)
+            } catch (e: Exception) {
+                refs--
+                n.close()
+                net = null
+                throw IOException("ネットワーク探索に失敗: ${e.message}")
+            } ?: run {
+                refs--
+                // Keep the network handle for diagnosis; caller reads it.
+                throw IOException(
+                    "カメラが見つかりません (${BuildConfig.CAM_HOST})。" +
+                        "カメラのWi-Fiに接続してからもう一度。"
+                )
+            }
             transport = t
             val c = OpcClient(t)
-            c.connect()
-            c.syncClock()
+            try {
+                c.connect()
+            } catch (e: Exception) {
+                refs--
+                runCatching { t.close() }
+                runCatching { n.close() }
+                net = null
+                transport = null
+                throw IOException("カメラ応答なし: ${e.message}")
+            }
+            try {
+                c.syncClock()
+            } catch (_: Exception) { /* non-fatal */ }
             client = c
             return c
         }

@@ -33,16 +33,48 @@ class OpcTransport(
     readTimeoutMs: Long = 15_000,
 ) : Closeable {
 
-    @Volatile private var ua: String = Opc.UA_SPEC
+    @Volatile private var ua: String = Opc.UA_DEFAULT
 
     private val socketFactory: SocketFactory? =
         network?.socketFactory
+
+    /**
+     * Wraps [socketFactory] so every socket is explicitly bound to the
+     * camera network. Factory sockets usually inherit the bind, but
+     * explicit bindSocket() survives OEMs where they don't — without it
+     * HTTP silently leaves via mobile data and times out.
+     */
+    private val boundFactory: SocketFactory? = socketFactory?.let { base ->
+        val net = network ?: return@let base
+        object : SocketFactory() {
+            private fun bind(s: Socket): Socket {
+                runCatching { net.bindSocket(s) }
+                return s
+            }
+
+            override fun createSocket(): Socket = bind(base.createSocket())
+            override fun createSocket(host: String, port: Int): Socket =
+                bind(base.createSocket(host, port))
+
+            override fun createSocket(
+                host: String, port: Int, localHost: java.net.InetAddress, localPort: Int,
+            ): Socket = bind(base.createSocket(host, port, localHost, localPort))
+
+            override fun createSocket(host: java.net.InetAddress, port: Int): Socket =
+                bind(base.createSocket(host, port))
+
+            override fun createSocket(
+                addr: java.net.InetAddress, port: Int,
+                localAddr: java.net.InetAddress, localPort: Int,
+            ): Socket = bind(base.createSocket(addr, port, localAddr, localPort))
+        }
+    }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .apply {
             // Route sockets via the camera network only. DNS never runs
             // for a literal IP, so no Dns override is needed.
-            if (socketFactory != null) socketFactory(socketFactory)
+            if (boundFactory != null) socketFactory(boundFactory)
             connectTimeout(6, TimeUnit.SECONDS)
             readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
             writeTimeout(10, TimeUnit.SECONDS)
@@ -94,13 +126,13 @@ class OpcTransport(
     private fun exec(req: Request): Response {
         val call: Call = client.newCall(req)
         var resp = call.execute()
-        // One UA fallback: spec UA first, OI.Share UA on handshake-only
-        // failures (400/403/404 on the very first command).
-        if (!resp.isSuccessful && resp.code in 400..404 && ua == Opc.UA_SPEC &&
+        // One UA fallback: OI.Share UA first (shipping bodies), spec UA
+        // on handshake-only failures (400/403/404 on the first command).
+        if (!resp.isSuccessful && resp.code in 400..404 && ua == Opc.UA_DEFAULT &&
             req.url.encodedPath.endsWith("get_connectmode.cgi")
         ) {
             resp.close()
-            ua = Opc.UA_OISHARE
+            ua = Opc.UA_SPEC
             resp = client.newCall(
                 req.newBuilder().header("User-Agent", ua).build()
             ).execute()
@@ -116,17 +148,51 @@ class OpcTransport(
         }
     }
 
-    /** TCP reachability probe that honors the bound network. */
-    fun probe(timeoutMs: Int = 2_000): Boolean {
-        return try {
-            val s: Socket = socketFactory?.createSocket() ?: Socket()
-            s.use {
-                it.connect(InetSocketAddress(host, port), timeoutMs)
-                true
-            }
-        } catch (_: IOException) {
-            false
+    /**
+     * Handshake GET with UA failover. Some bodies silently drop unknown
+     * UAs (zero bytes, read timeout) instead of answering 4xx — so on a
+     * timeout during the FIRST command, flip the UA once and retry.
+     * Returns the body string. Only for the handshake path.
+     */
+    @Throws(IOException::class)
+    fun handshakeGet(path: String, vararg args: Pair<String, String>): String {
+        try {
+            return getString(path, *args)
+        } catch (e: java.net.SocketTimeoutException) {
+            // Flip UA and retry once.
+            ua = if (ua == Opc.UA_DEFAULT) Opc.UA_SPEC else Opc.UA_DEFAULT
+            return getString(path, *args)
         }
+    }
+
+    /**
+     * TCP reachability probe that honors the bound network.
+     * Retries: the camera's HTTP server can lag behind the Wi-Fi join
+     * by seconds, and the first SYN often loses the race.
+     */
+    fun probe(timeoutMs: Int = 2_000, attempts: Int = 3): Boolean {
+        repeat(attempts) { i ->
+            try {
+                val s: Socket = socketFactory?.createSocket() ?: Socket()
+                // Explicit bind survives OEMs where factory sockets
+                // don't stick to the requested network.
+                val net = network
+                if (net != null) runCatching { net.bindSocket(s) }
+                s.use {
+                    it.connect(InetSocketAddress(host, port), timeoutMs)
+                    return true
+                }
+            } catch (_: IOException) {
+                if (i + 1 < attempts) {
+                    try {
+                        Thread.sleep(500L * (i + 1))
+                    } catch (_: InterruptedException) {
+                        return false
+                    }
+                }
+            }
+        }
+        return false
     }
 
     override fun close() {

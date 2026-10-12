@@ -11,13 +11,14 @@ object Opc {
     const val PORT = 80
 
     /**
-     * Mandatory User-Agent (spec §3: camera rejects other values).
-     * The 1.0a spec mandates `OlympusCameraKit`; shipping cameras also
-     * accept the OI.Share UA. We default to the spec value and fall back
-     * to the OI.Share UA once if the handshake fails.
+     * Mandatory User-Agent. Shipping bodies (E-M5 II era onward) accept
+     * ONLY the OI.Share UA and silently drop anything else — including
+     * the spec's `OlympusCameraKit`. So OI.Share first, spec second.
+     * Verified on a real E-M5 II (2026-10-12): OlympusCameraKit gets
+     * zero bytes back, `OI.Share v2` answers instantly.
      */
+    const val UA_DEFAULT = "OI.Share v2"
     const val UA_SPEC = "OlympusCameraKit"
-    const val UA_OISHARE = "OI.Share v2"
 
     fun baseUrl(host: String = HOST) = "http://$host/"
 }
@@ -45,6 +46,8 @@ data class CameraInfo(
     val maker: String = "",
     /** Raw command -> allowed args tree, for capability checks. Empty = unknown. */
     val commands: Map<String, Set<String>> = emptyMap(),
+    /** Structured capability document (preferred over [commands]). */
+    val caps: CapabilityDoc = CapabilityDoc(),
 ) {
     /** True when the camera advertises the command (or when unknown — try anyway). */
     fun supports(cmd: String): Boolean = commands.isEmpty() || commands.containsKey(cmd)
@@ -53,6 +56,19 @@ data class CameraInfo(
         val args = commands[cmd] ?: return true
         return args.isEmpty() || args.contains("$arg=$value")
     }
+}
+
+/**
+ * Wire dialect: which command spellings this body speaks.
+ * Detected from connectmode + capabilities, never from the model name.
+ */
+enum class Dialect {
+    /** OI.Share private bodies (E-M5 II verified): starttake, ctrlzoom, … */
+    PRIVATE,
+    /** AIR A01-era draft: newstarttake, newctrlzoom, switch_cameramode. */
+    AIR,
+    /** No command list: probe both spellings per call. */
+    UNKNOWN,
 }
 
 data class CamProp(

@@ -228,7 +228,8 @@ class H(BaseHTTPRequestHandler):
         get = lambda k, d="": q.get(k, [d])[0]
 
         if p == "/get_connectmode.cgi":
-            self._xml("<connectmode>OPC</connectmode>")
+            self._send(200, "text/xml",
+                        b'<?xml version="1.0"?>\n<connectmode>private</connectmode>\n')
         elif p == "/get_commandlist.cgi":
             self._xml(COMMANDLIST)
         elif p == "/get_caminfo.cgi":
@@ -236,11 +237,11 @@ class H(BaseHTTPRequestHandler):
         elif p == "/switch_cammode.cgi":
             MODE["cur"] = get("mode", "play")
             evt(2, 201)  # operation mode changed
-            self._xml("<result>OK</result>")
+            self._send(200, "text/xml", b"")
         elif p == "/switch_cameramode.cgi":
             MODE["cur"] = {"rec": "rec", "play": "play"}.get(get("mode"), "play")
             evt(2, 201)
-            self._xml("<result>OK</result>")
+            self._send(200, "text/xml", b"")
         elif p == "/start_pushevent.cgi":
             port = int(get("port", "65000"))
             if EVT is not None:
@@ -294,20 +295,23 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "image/jpeg", r["screen"])
         elif p == "/exec_takemotion.cgi":
             com = get("com")
-            if com == "newstarttake":
+            if com in ("starttake", "newstarttake"):
                 evt(2, 103)  # capture started
                 r = add_photo("shot")
                 save_shot(r)
                 evt(2, 106)  # capture finished
                 evt(2, 107)  # capture process finished
                 evt(2, 108)  # preview generated
-                self._xml("<result>OK</result>")
-            elif com in ("newstartmovietake", "newstopmovietake"):
-                REC["on"] = com == "newstartmovietake"
+                # Real shape: <take>ok</take>.
+                self._send(200, "text/xml",
+                            b'<?xml version="1.0"?><response><take>ok</take></response>')
+            elif com in ("startmovietake", "newstartmovietake",
+                         "stopmovietake", "newstopmovietake"):
+                REC["on"] = com in ("startmovietake", "newstartmovietake")
                 evt(2, 135 if REC["on"] else 110)
-                self._xml("<result>OK</result>")
+                self._send(200, "text/xml", b"")
             else:
-                self._xml("<result>OK</result>")
+                self._send(200, "text/xml", b"")
         elif p == "/exec_takemisc.cgi":
             com = get("com")
             if com == "startliveview":
@@ -325,8 +329,20 @@ class H(BaseHTTPRequestHandler):
             elif com == "getrecview":
                 r = ROLL[-1] if ROLL else add_photo("recview")
                 self._send(200, "image/jpeg", r["screen"])
+            elif com == "getlastjpg":
+                r = ROLL[-1] if ROLL else add_photo("recview")
+                self._send(200, "image/jpeg", r["bytes"])
             elif com == "changelvqty":
-                self._xml("<result>OK</result>")
+                self._send(200, "text/xml", b"")
+            elif com == "ctrlzoom":
+                move = get("move")
+                if move == "telemove":
+                    FOCAL["cur"] = min(FOCAL["max"], FOCAL["cur"] + 5)
+                elif move == "widemove":
+                    FOCAL["cur"] = max(FOCAL["min"], FOCAL["cur"] - 5)
+                elif move == "off":
+                    evt(2, 122)  # lens drive stopped
+                self._send(200, "text/xml", b"")
             elif com == "newctrlzoom":
                 ctrl, direction = get("ctrl"), get("dir")
                 if direction == "fix":
@@ -337,9 +353,9 @@ class H(BaseHTTPRequestHandler):
                     FOCAL["cur"] = max(FOCAL["min"], min(FOCAL["max"], FOCAL["cur"] + step))
                 elif ctrl == "stop":
                     evt(2, 122)  # lens drive stopped
-                self._xml("<result>OK</result>")
+                self._send(200, "text/xml", b"")
             else:
-                self._xml("<result>OK</result>")
+                self._send(200, "text/xml", b"")
         elif p == "/exec_shutter.cgi":
             com = get("com")
             if com == "1st2ndpush":
@@ -351,7 +367,7 @@ class H(BaseHTTPRequestHandler):
                 evt(2, 106)
                 evt(2, 107)
                 evt(2, 108)
-            self._xml("<result>OK</result>")
+            self._send(200, "text/xml", b"")
         elif p == "/exec_erase.cgi":
             r = find(get("DIR"))
             if r is None:
@@ -431,33 +447,43 @@ def save_shot(r: dict) -> None:
             f.write(r["bytes"])
 
 
-COMMANDLIST = """<cgi name="switch_cammode.cgi"><http_method type="get">
-<cmd name="mode"><param name="rec"/><param name="play"/><param name="shutter"/></cmd>
+COMMANDLIST = """<cgi name="switch_cammode"><http_method type="get">
+<cmd1 name="mode"><param1 name="rec"><cmd2 name="lvqty"><param2 name="0320x0240"/><param2 name="0640x0480"/><param2 name="0800x0600"/><param2 name="1024x0768"/><param2 name="1280x0960"/></cmd2></param1><param1 name="play"/><param1 name="shutter"/></cmd1>
 </http_method></cgi>
-<cgi name="get_imglist.cgi"><http_method type="get">
-<cmd name="DIR"><param name="*"/></cmd>
+<cgi name="get_imglist"><http_method type="get">
+<cmd1 name="DIR"/>
 </http_method></cgi>
-<cgi name="get_thumbnail.cgi"><http_method type="get">
-<cmd name="DIR"><param name="*"/></cmd>
+<cgi name="get_thumbnail"><http_method type="get">
+<cmd1 name="DIR"/>
 </http_method></cgi>
-<cgi name="get_screennail.cgi"><http_method type="get">
-<cmd name="DIR"><param name="*"/></cmd>
+<cgi name="get_screennail"><http_method type="get">
+<cmd1 name="DIR"/>
 </http_method></cgi>
-<cgi name="exec_takemotion.cgi"><http_method type="get">
-<cmd name="com"><param name="newstarttake"/><param name="newstoptake"/>
-<param name="newstartmovietake"/><param name="newstopmovietake"/></cmd>
+<cgi name="get_resizeimg"><http_method type="get">
+<cmd1 name="DIR"><param1><cmd2 name="size"><param2 name="1024"/><param2 name="1600"/><param2 name="1920"/><param2 name="2048"/></cmd2></param1></cmd1>
 </http_method></cgi>
-<cgi name="exec_takemisc.cgi"><http_method type="get">
-<cmd name="com"><param name="startliveview"/><param name="stopliveview"/>
-<param name="getrecview"/><param name="changelvqty"/></cmd>
+<cgi name="exec_takemotion"><http_method type="get">
+<cmd1 name="com"><param1 name="starttake"><cmd2 name="point"/></param1><param1 name="stoptake"/><param1 name="startmovietake"/><param1 name="stopmovietake"/></cmd1>
 </http_method></cgi>
-<cgi name="get_camprop.cgi"><http_method type="get">
-<cmd name="com"><param name="desc"/><param name="get"/></cmd>
-<cmd name="propname"><param name="*"/></cmd>
+<cgi name="exec_takemisc"><http_method type="get">
+<cmd1 name="com"><param1 name="startliveview"><cmd2 name="port"/></param1><param1 name="stopliveview"/><param1 name="getrecview"/><param1 name="getlastjpg"/><param1 name="ctrlzoom"><cmd2 name="move"><param2 name="widemove"/><param2 name="telemove"/><param2 name="off"/></cmd2></param1></cmd1>
 </http_method></cgi>
-<cgi name="set_camprop.cgi"><http_method type="post">
-<cmd name="com"><param name="set"/></cmd>
-<cmd name="propname"><param name="*"/></cmd>
+<cgi name="exec_shutter"><http_method type="get">
+<cmd1 name="com"><param1 name="1st2ndpush"/><param1 name="2nd1strelease"/></cmd1>
+</http_method></cgi>
+<cgi name="get_camprop"><http_method type="get">
+<cmd1 name="com"><param1 name="desc"/><param1 name="get"/></cmd1>
+<cmd1 name="propname"><param1 name="*"/></cmd1>
+</http_method></cgi>
+<cgi name="set_camprop"><http_method type="post">
+<cmd1 name="com"><param1 name="set"/></cmd1>
+<cmd1 name="propname"><param1 name="*"/></cmd1>
+</http_method></cgi>
+<cgi name="exec_erase"><http_method type="get">
+<cmd1 name="DIR"/>
+</http_method></cgi>
+<cgi name="exec_protect"><http_method type="get">
+<cmd1 name="com"><param1 name="set"/><param1 name="release"/></cmd1>
 </http_method></cgi>"""
 
 

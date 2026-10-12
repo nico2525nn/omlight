@@ -31,11 +31,21 @@ class TransferStore(ctx: Context) {
         return load().any { it.path == path && it.size == size && it.takenAt == takenAt }
     }
 
+    /** Hash-verified check: same identity AND same SHA-256. */
     @Synchronized
-    fun markDone(path: String, size: Long, takenAt: Long) {
+    fun isDoneVerified(path: String, size: Long, takenAt: Long, sha256: String): Boolean {
+        if (sha256.isEmpty()) return isDone(path, size, takenAt)
+        prune()
+        return loadRaw().any {
+            it.path == path && it.size == size && it.takenAt == takenAt && it.sha256 == sha256
+        }
+    }
+
+    @Synchronized
+    fun markDone(path: String, size: Long, takenAt: Long, sha256: String = "") {
         val cur = loadRaw().toMutableList()
         cur.removeAll { it.path == path }
-        cur.add(DoneRaw(path, size, takenAt, System.currentTimeMillis()))
+        cur.add(DoneRaw(path, size, takenAt, System.currentTimeMillis(), sha256))
         pruneInPlace(cur)
         saveRaw(cur)
     }
@@ -67,12 +77,13 @@ class TransferStore(ctx: Context) {
         return changed || cur.size != before
     }
 
-    /** Storage row: identity + phone save time. */
+    /** Storage row: identity + phone save time + content hash. */
     private data class DoneRaw(
         val path: String,
         val size: Long,
         val takenAt: Long,
         val savedAt: Long,
+        val sha256: String = "",
     )
 
     @Synchronized
@@ -163,6 +174,7 @@ class TransferStore(ctx: Context) {
                     // v1 rows lack savedAt: treat as now (don't nuke
                     // history on upgrade; they'll age out naturally).
                     o.optLong("saved", System.currentTimeMillis()),
+                    o.optString("sha", ""),
                 )
             }
         } catch (_: Exception) {
@@ -176,6 +188,7 @@ class TransferStore(ctx: Context) {
             a.put(
                 JSONObject().put("p", d.path).put("s", d.size)
                     .put("t", d.takenAt).put("saved", d.savedAt)
+                    .put("sha", d.sha256)
             )
         }
         prefs.edit().putString(KEY_DONE, a.toString()).apply()
