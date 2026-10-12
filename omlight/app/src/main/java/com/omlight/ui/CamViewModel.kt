@@ -8,16 +8,15 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewModelScope
 import com.omlight.cam.CamEntry
 import com.omlight.cam.CamProp
-import com.omlight.cam.CameraNetwork
+import com.omlight.cam.CamSession
 import com.omlight.cam.EventReceiver
 import com.omlight.cam.LiveviewReceiver
 import com.omlight.cam.OpcClient
-import com.omlight.cam.OpcTransport
 import com.omlight.dl.DlItem
 import com.omlight.dl.DownloadService
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
-import com.omlight.BuildConfig
+import java.io.IOException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -110,14 +109,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     var linkDown: Boolean by mutableStateOf(false)
         private set
 
-    private var camNet: CameraNetwork? = null
-    private var transport: OpcTransport? = null
-    private var client: OpcClient? = null
     private var liveJob: Job? = null
     private var thumbJob: Job? = null
     private var eventJob: Job? = null
     private var reconnectJob: Job? = null
     private var failures = 0
+    /** Our outstanding CamSession ref (true between connect and disconnect). */
+    private var holding = false
+
+    /** Current shared client, or null when disconnected. */
+    private suspend fun client(): OpcClient? = CamSession.peek()
 
     // -- connection ---------------------------------------------------------------
 
@@ -127,29 +128,19 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             conn = Conn.Searching
             statusMsg = null
             try {
-                val net = (camNet ?: CameraNetwork(getApplication()).also { camNet = it })
-                val t = withContext(Dispatchers.IO) {
-                    net.findCamera(BuildConfig.CAM_HOST, BuildConfig.CAM_PORT)
+                val c = withContext(Dispatchers.IO) {
+                    CamSession.acquire(getApplication())
                 }
-                if (t == null) {
-                    conn = Conn.Failed("カメラが見つかりません。カメラのWi-Fiに接続してからもう一度。")
-                    return@launch
-                }
-                transport = t
-                val c = OpcClient(t)
-                withContext(Dispatchers.IO) {
-                    c.connect()
-                    c.syncClock()
-                }
-                client = c
+                holding = true
                 val model = c.info.model.ifEmpty { "OPC camera" }
                 conn = Conn.Ready(model)
                 failures = 0
                 linkDown = false
-                if (net.vpnActive()) {
+                val net = CamSession.network()
+                if (net?.vpnActive() == true) {
                     statusMsg = "VPNが有効です。カメラに繋がらない場合はVPNを切ってください"
                 }
-                net.watchLoss {
+                net?.watchLoss {
                     viewModelScope.launch {
                         linkDown = true
                         statusMsg = "カメラのWi-Fiが切れました。再接続してください"
@@ -158,6 +149,10 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 startEventStream(c)
                 refresh()
             } catch (e: Exception) {
+                if (holding) {
+                    withContext(Dispatchers.IO) { CamSession.release() }
+                    holding = false
+                }
                 conn = Conn.Failed(e.message ?: "接続エラー")
             }
         }
@@ -241,8 +236,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             reconnectJob = viewModelScope.launch {
                 delay(1_500)
                 try {
-                    val c = client
-                    if (c != null) withContext(Dispatchers.IO) { c.connect() }
+                    val c = client() ?: throw IOException("no session")
+                    withContext(Dispatchers.IO) { c.connect() }
                     noteSuccess()
                     statusMsg = "再接続しました"
                     refresh()
@@ -261,14 +256,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         eventJob = null
         reconnectJob?.cancel()
         reconnectJob = null
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { client?.idle() }
-            runCatching { transport?.close() }
-            runCatching { camNet?.close() }
+        thumbJob?.cancel()
+        if (holding) {
+            holding = false
+            // closeNow, not release: the disconnect button means "drop the
+            // camera now", even if a transfer holds a ref (it will fail
+            // fast with a clear error and can retry after reconnect).
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { CamSession.closeNow() }
+            }
         }
-        client = null
-        transport = null
-        camNet = null
         entries = emptyList()
         thumbs.clear()
         props = emptyList()
@@ -282,9 +279,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     // -- browsing -------------------------------------------------------------------
 
     fun refresh() {
-        val c = client ?: return
         if (refreshing) return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             refreshing = true
             try {
                 val list = withContext(Dispatchers.IO) { c.allImages() }
@@ -307,8 +304,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun prefetchThumbs(first: List<CamEntry>) {
         thumbJob?.cancel()
-        val c = client ?: return
         thumbJob = viewModelScope.launch(Dispatchers.IO) {
+            val c = client() ?: return@launch
             // Disk cache first (instant), then network with a small
             // parallelism cap — old camera HTTP stacks fall over with
             // dozens of concurrent connections.
@@ -368,8 +365,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             thumbFetching.remove(entry.path)
             return
         }
-        val c = client ?: run { thumbFetching.remove(entry.path); return }
         viewModelScope.launch(Dispatchers.IO) {
+            val c = client() ?: run { thumbFetching.remove(entry.path); return@launch }
             thumbSem.acquire()
             try {
                 if (thumbs.containsKey(entry.path)) return@launch
@@ -408,11 +405,11 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     // -- detail -------------------------------------------------------------------------
 
     fun openDetail(path: String) {
-        val c = client ?: return
         detailPath = path
         detailJpeg = null
         if (detailLoading) return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             detailLoading = true
             try {
                 detailJpeg = withContext(Dispatchers.IO) { c.preview(path) }
@@ -432,9 +429,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun deleteDetail() {
-        val c = client ?: return
         val path = detailPath ?: return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             try {
                 val ok = withContext(Dispatchers.IO) { c.delete(path) }
                 if (ok) {
@@ -453,9 +450,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun protectDetail(on: Boolean) {
-        val c = client ?: return
         val path = detailPath ?: return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             try {
                 val ok = withContext(Dispatchers.IO) { c.protect(path, on) }
                 statusMsg = if (ok) (if (on) "保護しました" else "保護を解除しました")
@@ -471,9 +468,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     // -- shooting ---------------------------------------------------------------------
 
     fun shoot() {
-        val c = client ?: return
         if (shooting) return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             shooting = true
             captureState = "撮影中…"
             try {
@@ -498,9 +495,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
      * frame. Converted to the current lvqty coordinate space.
      */
     fun shootAt(fx: Float, fy: Float) {
-        val c = client ?: return
         if (shooting) return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             shooting = true
             captureState = "AF合わせ…"
             try {
@@ -532,8 +529,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun zoomHold(dir: OpcClient.ZoomDir, start: Boolean) {
-        val c = client ?: return
         viewModelScope.launch(Dispatchers.IO) {
+            val c = client() ?: return@launch
             try {
                 if (start) c.zoomStart(dir) else c.zoomStop(dir)
                 noteSuccess()
@@ -544,8 +541,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleMovie() {
-        val c = client ?: return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             try {
                 val start = !recording
                 withContext(Dispatchers.IO) { c.movieRecord(start) }
@@ -568,12 +565,12 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun startLive() {
-        val c = client ?: return
         if (liveJob != null) return
         liveRunning = true
         liveJob = viewModelScope.launch(Dispatchers.IO) {
+            val c = client() ?: return@launch
             try {
-                LiveviewReceiver().use { rx ->
+                LiveviewReceiver(network = c.network).use { rx ->
                     withContext(Dispatchers.IO) { c.startLiveview(rx.port) }
                     try {
                         while (isActive) {
@@ -602,16 +599,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         liveRunning = false
         liveFrame = null
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { client?.stopLiveview() }
+            runCatching { client()?.stopLiveview() }
         }
     }
 
     // -- camera props ---------------------------------------------------------------------
 
     fun loadProps() {
-        val c = client ?: return
         if (propsLoading) return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             propsLoading = true
             try {
                 props = withContext(Dispatchers.IO) { c.camPropList() }
@@ -627,8 +624,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun setProp(name: String, value: String) {
-        val c = client ?: return
         viewModelScope.launch {
+            val c = client() ?: return@launch
             try {
                 withContext(Dispatchers.IO) { c.setCamProp(name, value) }
                 props = props.map { if (it.name == name) it.copy(value = value) else it }
@@ -653,25 +650,20 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             conn = Conn.Searching
             statusMsg = null
             try {
-                val net = (camNet ?: CameraNetwork(getApplication()).also { camNet = it })
-                val t = net.requestCameraAp(ssid, passphrase)
-                if (t == null) {
-                    conn = Conn.Failed("APへの接続をキャンセルしたか、カメラが応答しません。")
-                    return@launch
+                val c = withContext(Dispatchers.IO) {
+                    CamSession.acquireAp(getApplication(), ssid, passphrase)
                 }
-                transport = t
-                val c = OpcClient(t)
-                withContext(Dispatchers.IO) {
-                    c.connect()
-                    c.syncClock()
-                }
-                client = c
+                holding = true
                 conn = Conn.Ready(c.info.model.ifEmpty { "OPC camera" })
                 failures = 0
                 linkDown = false
                 startEventStream(c)
                 refresh()
             } catch (e: Exception) {
+                if (holding) {
+                    withContext(Dispatchers.IO) { CamSession.release() }
+                    holding = false
+                }
                 conn = Conn.Failed(e.message ?: "接続エラー")
             }
         }
@@ -698,15 +690,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         thumbJob?.cancel()
         // Synchronous teardown: viewModelScope is cancelled right after
         // onCleared returns, so launching here would never run.
-        // Best-effort with a short timeout; each op is one HTTP call.
-        val t = Thread({
-            runCatching { client?.idle() }
-            runCatching { transport?.close() }
-            runCatching { camNet?.close() }
-        }, "omlight-teardown")
-        t.isDaemon = true
-        t.start()
-        runCatching { t.join(3_000) }
+        if (holding) {
+            holding = false
+            val t = Thread({
+                // Blocking bridge into the suspend API.
+                kotlinx.coroutines.runBlocking { CamSession.release() }
+            }, "omlight-teardown")
+            t.isDaemon = true
+            t.start()
+            runCatching { t.join(3_000) }
+        }
         super.onCleared()
     }
 }

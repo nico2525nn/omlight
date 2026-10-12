@@ -257,7 +257,7 @@ private fun ConnectGate(vm: CamViewModel) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
-                            val perm = if (android.os.Build.VERSION.SDK_INT >= 31) {
+                            val perm = if (android.os.Build.VERSION.SDK_INT >= 33) {
                                 android.Manifest.permission.NEARBY_WIFI_DEVICES
                             } else {
                                 android.Manifest.permission.ACCESS_FINE_LOCATION

@@ -25,8 +25,15 @@ import kotlinx.coroutines.launch
  *
  * Runs on its own scope; [events] is a hot flow the UI/session subscribes
  * to. Reconnects are the session's job (call [stop]/[start] around them).
+ *
+ * @param network camera network for socket binding (null = default route,
+ * emulator fallback). Without binding, the event TCP would leave via
+ * mobile data when the AP is app-requested.
  */
-class EventReceiver(private val host: String) {
+class EventReceiver(
+    private val host: String,
+    private val network: android.net.Network? = null,
+) {
 
     data class Event(
         val appId: Int,
@@ -59,6 +66,8 @@ class EventReceiver(private val host: String) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
+    /** Live socket, closed directly by stop() to unblock reads. */
+    @Volatile private var liveSock: Socket? = null
 
     private val _events = MutableSharedFlow<Event>(
         replay = 0,
@@ -84,13 +93,21 @@ class EventReceiver(private val host: String) {
                 // Connect with backoff (camera opens the port async).
                 while (isActive && sock == null && attempt < 10) {
                     try {
-                        sock = Socket()
-                        sock.tcpNoDelay = true
-                        sock.soTimeout = 0 // blocking reads; closed by stop()
-                        sock.connect(InetSocketAddress(host, port), 2_000)
+                        val s = network?.socketFactory?.createSocket() ?: Socket()
+                        // bindSocket is belt-and-braces: factory sockets are
+                        // already bound, but explicit bind survives OEM quirks.
+                        if (network != null) {
+                            runCatching { network.bindSocket(s) }
+                        }
+                        s.tcpNoDelay = true
+                        s.soTimeout = 0 // blocking reads; closed by stop()
+                        s.connect(InetSocketAddress(host, port), 2_000)
+                        sock = s
+                        liveSock = s
                     } catch (_: IOException) {
                         runCatching { sock?.close() }
                         sock = null
+                        liveSock = null
                         attempt++
                         delay(300L * attempt)
                     }
@@ -130,6 +147,10 @@ class EventReceiver(private val host: String) {
     fun stop() {
         job?.cancel()
         job = null
+        // Unblock the reader thread immediately; cancel() alone would
+        // leave it parked in read() until the camera speaks or dies.
+        runCatching { liveSock?.close() }
+        liveSock = null
         running = false
     }
 

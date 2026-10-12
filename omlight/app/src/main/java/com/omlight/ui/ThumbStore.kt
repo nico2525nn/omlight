@@ -51,13 +51,19 @@ class ThumbStore(ctx: Context) {
 
     private fun evictIfNeeded() {
         val files = try { dir.listFiles().orEmpty() } catch (_: Exception) { return }
-        if (files.size <= MAX_FILES) {
-            val total = files.sumOf { it.length() }
-            if (total <= MAX_BYTES) return
+        val total = files.sumOf { it.length() }
+        if (files.size <= MAX_FILES && total <= MAX_BYTES) return
+        // Over budget (count OR bytes): delete oldest until both fit,
+        // keeping at least a quarter of the file budget.
+        val target = (MAX_FILES * 3 / 4).coerceAtLeast(100)
+        var freed = 0L
+        var kept = files.size
+        for (f in files.sortedBy { it.lastModified() }) {
+            if (kept <= target && total - freed <= MAX_BYTES) break
+            freed += f.length()
+            kept--
+            runCatching { f.delete() }
         }
-        files.sortedBy { it.lastModified() }
-            .dropLast(MAX_FILES / 2)
-            .forEach { runCatching { it.delete() } }
     }
 
     companion object {

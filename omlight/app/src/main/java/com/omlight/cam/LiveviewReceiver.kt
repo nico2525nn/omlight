@@ -16,10 +16,24 @@ import java.net.SocketTimeoutException
  *
  * Camera settings ride in the extension header of the first packet; we
  * skip it (length word counts 32-bit words after the 4-byte header).
+ *
+ * @param network camera network to bind the UDP socket to (null =
+ * default route). Binding matters for app-requested APs where the
+ * default route is mobile data.
  */
-class LiveviewReceiver(port: Int = 0) : AutoCloseable {
+class LiveviewReceiver(
+    port: Int = 0,
+    network: android.net.Network? = null,
+) : AutoCloseable {
 
-    private val sock = DatagramSocket(port).apply { soTimeout = 3_000 }
+    private val sock = DatagramSocket(null).apply {
+        if (network != null) {
+            // Bind BEFORE bind(): routes the socket via the camera AP.
+            network.bindSocket(this)
+        }
+        bind(java.net.InetSocketAddress(port))
+        soTimeout = 3_000
+    }
     /** Actual bound port — pass to `startliveview`. */
     val port: Int get() = sock.localPort
 

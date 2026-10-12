@@ -26,5 +26,11 @@ Thumbs.db
 *.apk
 *.aab
 
+# Release signing (never commit)
+release.keystore
+keystore.properties
+*.keystore
+*.jks
+
 # Original vendor APK (not part of this clean-room project)
 com.omdigitalsolutions.oishare_v157.apk

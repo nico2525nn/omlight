@@ -56,12 +56,18 @@ def make_jpeg(w: int, h: int, label: str, hue: int) -> bytes:
     return buf.getvalue()
 
 
-def add_photo(tag: str) -> dict:
+def add_photo(tag: str, folder: str = "/DCIM/100OLYMP", raw: bool = False) -> dict:
     n = len(ROLL) + 1
-    name = f"P{n:06d}.JPG"
-    full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37)
+    ext = "ORF" if raw else "JPG"
+    name = f"P{n:06d}.{ext}"
+    if raw:
+        # Synthetic ORF: real Olympus header + padding (NOT a valid raw,
+        # but byte-identical in the magic the app verifies).
+        full = b"IIRO" + bytes(44000)
+    else:
+        full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37)
     ROLL.append({
-        "name": name, "dir": "/DCIM/100OLYMP",
+        "name": name, "dir": folder,
         "bytes": full,
         "thumb": make_jpeg(160, 120, name, 40 + n * 37),
         "screen": make_jpeg(640, 480, name, 40 + n * 37),
@@ -70,8 +76,11 @@ def add_photo(tag: str) -> dict:
 
 
 def seed_roll(count: int) -> None:
-    for _ in range(count):
-        add_photo("seed")
+    for i in range(count):
+        # Mix: every 4th is ORF, second half lives in 101OLYMP
+        # (same basenames across folders exercise temp-file collisions).
+        folder = "/DCIM/101OLYMP" if i >= count // 2 else "/DCIM/100OLYMP"
+        add_photo("seed", folder, raw=(i % 4 == 3))
 
 
 # DCF date/time pack (spec section 6)
@@ -250,12 +259,16 @@ class H(BaseHTTPRequestHandler):
         elif p == "/get_imglist.cgi":
             d = get("DIR", "/DCIM")
             if d == "/DCIM":
-                body = "VER_100\r\n/DCIM,100OLYMP,0,16,%d,%d\r\n" % pack_dt()
-            elif d == "/DCIM/100OLYMP":
+                dt = pack_dt()
+                body = ("VER_100\r\n/DCIM,100OLYMP,0,16,%d,%d\r\n"
+                        "/DCIM,101OLYMP,0,16,%d,%d\r\n" % (dt + dt))
+            elif d in ("/DCIM/100OLYMP", "/DCIM/101OLYMP"):
                 lines = ["VER_100"]
                 date, tm = pack_dt()
                 for r in ROLL:
-                    lines.append(f"/DCIM/100OLYMP,{r['name']},{len(r['bytes'])},32,{date},{tm}")
+                    if r["dir"] != d:
+                        continue
+                    lines.append(f"{d},{r['name']},{len(r['bytes'])},32,{date},{tm}")
                 body = "\r\n".join(lines) + "\r\n"
             else:
                 self._send(404, "text/plain", b"no such dir")
@@ -367,6 +380,7 @@ class H(BaseHTTPRequestHandler):
                 self._send(404, "text/plain", b"no such file")
                 return
             data = r["bytes"]
+            ctype = "application/octet-stream" if r["name"].endswith(".ORF") else "image/jpeg"
             # HTTP Range (resume): "bytes=N-".
             rng = self.headers.get("Range", "")
             if rng.startswith("bytes="):
@@ -382,14 +396,14 @@ class H(BaseHTTPRequestHandler):
                     return
                 part = data[start:]
                 self.send_response(206)
-                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Type", ctype)
                 self.send_header("Content-Range",
                                  f"bytes {start}-{len(data)-1}/{len(data)}")
                 self.send_header("Content-Length", str(len(part)))
                 self.end_headers()
                 self.wfile.write(part)
                 return
-            self._send(200, "image/jpeg", data)
+            self._send(200, ctype, data)
         else:
             self._send(404, "text/plain", b"unknown: " + p.encode())
 

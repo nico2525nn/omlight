@@ -126,7 +126,9 @@ class CameraNetwork(private val ctx: Context) : Closeable {
         }
 
     private fun hasNearbyWifiPermission(): Boolean =
-        if (Build.VERSION.SDK_INT >= 31) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            // NEARBY_WIFI_DEVICES exists only on 33+; on 31/32 the AP
+            // request path needs location instead.
             ContextCompat.checkSelfPermission(ctx, Manifest.permission.NEARBY_WIFI_DEVICES) ==
                 PackageManager.PERMISSION_GRANTED
         } else {

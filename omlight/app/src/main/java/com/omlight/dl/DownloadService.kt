@@ -15,11 +15,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
-import com.omlight.BuildConfig
 import com.omlight.MainActivity
 import com.omlight.R
-import com.omlight.cam.CameraNetwork
-import com.omlight.cam.OpcClient
+import com.omlight.cam.CamSession
 import com.omlight.cam.OpcTransport
 import java.io.File
 import java.io.IOException
@@ -78,9 +76,7 @@ class DownloadService : LifecycleService() {
     private val mutex = Mutex()
     private var worker: Job? = null
 
-    private var camNet: CameraNetwork? = null
-    private var transport: OpcTransport? = null
-    private var client: OpcClient? = null
+    private var holding = false
 
     override fun onCreate() {
         super.onCreate()
@@ -185,13 +181,18 @@ class DownloadService : LifecycleService() {
             _state.update { it.copy(queued = it.queued - 1) }
             mutex.withLock { pending.remove(item) }
             persistQueue()
+            // Journal BEFORE downloading: a crash from here on resumes
+            // this file via Range. Cleared only after publish.
+            store.setActive(item)
             try {
                 ensureClient()
                 downloadOne(item)
                 store.markDone(item.path, item.sizeBytes, item.takenAt)
+                store.setActive(null)
                 _state.update { it.copy(done = it.done + 1, active = null) }
             } catch (e: Paused) {
                 // Requeue at head; the pause gate above will hold.
+                // Keep the active journal: pause-then-kill still resumes.
                 mutex.withLock { pending.addFirst(item) }
                 queue.send(item)
                 _state.update { it.copy(queued = it.queued + 1, active = null) }
@@ -200,6 +201,7 @@ class DownloadService : LifecycleService() {
                 // Transport died (AP lost?): drop the client so the
                 // next item re-probes, then fail this item.
                 dropClient()
+                store.setActive(null)
                 _state.update {
                     it.copy(
                         failed = it.failed + item.path,
@@ -218,31 +220,38 @@ class DownloadService : LifecycleService() {
     }
 
     private suspend fun ensureClient() {
-        if (client != null) return
-        val net = (camNet ?: CameraNetwork(this).also { camNet = it })
-        val t = withContext(Dispatchers.IO) {
-            net.findCamera(BuildConfig.CAM_HOST, BuildConfig.CAM_PORT)
-        } ?: throw IOException("カメラが見つかりません")
-        net.watchLoss {
+        if (holding && CamSession.peek() != null) return
+        val c = CamSession.acquire(this)
+        holding = true
+        CamSession.network()?.watchLoss {
             // AP dropped mid-transfer: abort the current file (temp stays
             // for Range resume) and fail loudly instead of spinning.
             cancelCurrent = true
         }
-        transport = t
-        val c = OpcClient(t)
-        withContext(Dispatchers.IO) { c.connect() }
-        client = c
     }
 
-    private fun dropClient() {
-        runCatching { client?.idle() }
-        runCatching { transport?.close() }
-        client = null
-        transport = null
+    private suspend fun dropClient() {
+        // Don't release the ref here: the session may be shared with the
+        // UI. Just force the NEXT ensureClient to reconnect by closing
+        // the shared triple only when we hold the last ref... simpler:
+        // closeNow is too aggressive (kills UI too). Instead, poke the
+        // shared client to reconnect on next use.
+        //
+        // Decision: ask the shared client to re-handshake. OpcClient is
+        // stateless enough (mode re-sent) that connect() heals it.
+        try {
+            CamSession.peek()?.connect()
+        } catch (_: Exception) {
+            // Truly dead: release our ref so the next item re-acquires
+            // from scratch (and the UI's own failure path fires too).
+            if (holding) {
+                holding = false
+                CamSession.release()
+            }
+        }
     }
 
     private suspend fun downloadOne(item: DlItem) {
-        val c = client ?: throw IOException("not connected")
         _state.update {
             it.copy(active = item.path, activeBytes = 0L, activeTotal = item.sizeBytes)
         }
@@ -250,7 +259,9 @@ class DownloadService : LifecycleService() {
         withContext(Dispatchers.IO) {
             // Stage to a cache temp file first: allows Range resume and
             // post-download verification before anything hits MediaStore.
-            val tmp = File(cacheDir, "dl_" + item.path.substringAfterLast('/'))
+            // Name = hash of full identity (NOT the bare filename: two
+            // DCF folders can hold same-named files with same size).
+            val tmp = stagingFile(item)
             var offset = if (tmp.exists()) tmp.length() else 0L
             // Stale temp larger than expected (camera file replaced?): restart.
             if (item.sizeBytes > 0 && offset > item.sizeBytes) {
@@ -268,6 +279,10 @@ class DownloadService : LifecycleService() {
             var done = offset
             while (true) {
                 if (cancelCurrent) throw if (_state.value.paused) Paused() else Cancelled()
+                // Re-acquire per attempt: a mid-file drop rebuilds the
+                // client via ensureClientResume(); a stale handle would
+                // retry on a dead transport.
+                val c = CamSession.peek() ?: throw IOException("not connected")
                 // Actual fetch (possibly resumed from `done`).
                 c.originalFrom(item.path, done).use { r ->
                     if (r.code == 416) {
@@ -353,15 +368,34 @@ class DownloadService : LifecycleService() {
     }
 
     /**
+     * Staging file for [item]. Keyed by full camera path + size + taken
+     * time so same-named files in different DCF folders never collide.
+     */
+    private fun stagingFile(item: DlItem): File {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val id = "${item.path}|${item.sizeBytes}|${item.takenAt}"
+        val h = md.digest(id.toByteArray()).take(16).joinToString("") { "%02x".format(it) }
+        return File(cacheDir, "dl_$h.tmp")
+    }
+
+    /**
      * Expected total for this fetch: Content-Range total when resumed,
      * else Content-Length, else the listing size.
+     * Also validates that the resumed start matches our offset —
+     * a camera answering the wrong range would silently corrupt the file.
      */
     private fun contentTotal(r: okhttp3.Response, listed: Long, done: Long, resumed: Boolean): Long {
         if (resumed) {
-            // "bytes 100-199/1000" -> 1000.
+            // "bytes 100-199/1000" -> start 100, total 1000.
             val cr = r.header("Content-Range") ?: ""
-            val total = cr.substringAfterLast('/').toLongOrNull()
-            if (total != null && total > 0) return total
+            val m = Regex("""bytes (\d+)-(\d+)/(\d+)""").find(cr)
+            if (m == null) throw IOException("bad Content-Range: $cr")
+            val start = m.groupValues[1].toLong()
+            val total = m.groupValues[3].toLong()
+            if (start != done) {
+                throw IOException("range start mismatch (want $done, got $start)")
+            }
+            if (total > 0) return total
         }
         val len = r.body!!.contentLength()
         if (len > 0) return if (resumed) done + len else len
@@ -421,13 +455,19 @@ class DownloadService : LifecycleService() {
             }
             if (published >= 0 && published != tmp.length()) {
                 runCatching { resolver.delete(uri, null, null) }
+                // Corrupt publish: drop the temp too (bytes are suspect).
+                tmp.delete()
                 throw IOException("MediaStore size mismatch ($published != ${tmp.length()})")
             }
+            // Success: temp fully consumed.
+            tmp.delete()
         } catch (e: Exception) {
             runCatching { resolver.delete(uri, null, null) }
+            // Keep the temp on MediaStore-side failures (insert/copy):
+            // the bytes verified OK, only the publish failed, so a retry
+            // reuses them instead of re-downloading. (Size-mismatch
+            // already deleted the temp above.)
             throw e
-        } finally {
-            tmp.delete()
         }
     }
 
@@ -529,8 +569,12 @@ class DownloadService : LifecycleService() {
     override fun onDestroy() {
         worker?.cancel()
         queue.close()
-        dropClient()
-        runCatching { camNet?.close() }
+        if (holding) {
+            holding = false
+            // Release async: onDestroy can't suspend. The session mutex
+            // is uncontended here (worker already cancelled).
+            lifecycleScope.launch { runCatching { CamSession.release() } }
+        }
         super.onDestroy()
     }
 

@@ -26,42 +26,39 @@ class TransferStore(ctx: Context) {
     fun isDone(path: String, size: Long, takenAt: Long): Boolean {
         if (size <= 0) return false
         prune()
+        // Identity = camera path + size + photo time. savedAt is only
+        // used for expiry, never for identity.
         return load().any { it.path == path && it.size == size && it.takenAt == takenAt }
     }
 
     @Synchronized
     fun markDone(path: String, size: Long, takenAt: Long) {
-        val cur = load().toMutableList()
-        val d = Done(path, size, takenAt)
+        val cur = loadRaw().toMutableList()
         cur.removeAll { it.path == path }
-        cur.add(d)
+        cur.add(DoneRaw(path, size, takenAt, System.currentTimeMillis()))
         pruneInPlace(cur)
-        save(cur)
+        saveRaw(cur)
     }
 
     /**
-     * Drop entries older than KEEP_DAYS (by phone wall-clock at save
-     * time, stored alongside) and cap the count. Pruning keeps the
-     * JSON small and isDone() O(n)-cheap.
+     * Drop entries saved longer ago than KEEP_DAYS and cap the count.
+     * Expiry uses the phone wall-clock at save time — NOT the photo's
+     * taken date (an old photo downloaded today must stay skipped).
      */
     private fun prune() {
-        val cur = load().toMutableList()
-        if (pruneInPlace(cur)) save(cur)
+        val cur = loadRaw().toMutableList()
+        if (pruneInPlace(cur)) saveRaw(cur)
     }
 
-    private fun pruneInPlace(cur: MutableList<Done>): Boolean {
+    private fun pruneInPlace(cur: MutableList<DoneRaw>): Boolean {
         val before = cur.size
-        val cutoffPhoto = System.currentTimeMillis() - KEEP_DAYS * 24L * 3600 * 1000
-        // takenAt is the photo's FAT time; entries with unknown or ancient
-        // photo dates still prune by insertion order (list tail = newest).
         var changed = false
         while (cur.size > MAX_HISTORY) {
             cur.removeAt(0)
             changed = true
         }
-        // Also drop entries whose photo predates the window — re-download
-        // after 90 days is unsurprising and cheap to re-verify.
-        val kept = cur.filter { it.takenAt <= 0 || it.takenAt >= cutoffPhoto }
+        val cutoff = System.currentTimeMillis() - KEEP_DAYS * 24L * 3600 * 1000
+        val kept = cur.filter { it.savedAt >= cutoff }
         if (kept.size != cur.size) {
             cur.clear()
             cur.addAll(kept)
@@ -69,6 +66,14 @@ class TransferStore(ctx: Context) {
         }
         return changed || cur.size != before
     }
+
+    /** Storage row: identity + phone save time. */
+    private data class DoneRaw(
+        val path: String,
+        val size: Long,
+        val takenAt: Long,
+        val savedAt: Long,
+    )
 
     @Synchronized
     fun history(): List<Done> = load()
@@ -79,6 +84,9 @@ class TransferStore(ctx: Context) {
     }
 
     // -- pending queue journal ------------------------------------------------------
+    // Two slots: queued[] (not started) and active (mid-download).
+    // active is cleared only after MediaStore publish, so a crash
+    // mid-file resumes it via Range instead of losing it.
 
     @Synchronized
     fun saveQueue(items: List<DlItem>) {
@@ -93,42 +101,82 @@ class TransferStore(ctx: Context) {
 
     @Synchronized
     fun loadQueue(): List<DlItem> {
-        val raw = prefs.getString(KEY_QUEUE, null) ?: return emptyList()
-        return try {
+        // Active first (resume it), then the rest in order.
+        val out = ArrayList<DlItem>()
+        loadActive()?.let { out.add(it) }
+        val raw = prefs.getString(KEY_QUEUE, null) ?: return out
+        try {
             val a = JSONArray(raw)
-            List(a.length()) { i ->
+            for (i in 0 until a.length()) {
                 val o = a.getJSONObject(i)
-                DlItem(o.getString("p"), o.getLong("s"), o.optLong("t"))
+                out.add(DlItem(o.getString("p"), o.getLong("s"), o.optLong("t")))
             }
+        } catch (_: Exception) { /* corrupted journal: active still resumes */ }
+        return out
+    }
+
+    @Synchronized
+    fun setActive(item: DlItem?) {
+        val ed = prefs.edit()
+        if (item == null) {
+            ed.remove(KEY_ACTIVE)
+        } else {
+            ed.putString(
+                KEY_ACTIVE,
+                JSONObject().put("p", item.path).put("s", item.sizeBytes)
+                    .put("t", item.takenAt).toString(),
+            )
+        }
+        // Commit, not apply: the download starts right after; the journal
+        // must be on disk before any byte is trusted.
+        ed.commit()
+    }
+
+    private fun loadActive(): DlItem? {
+        val raw = prefs.getString(KEY_ACTIVE, null) ?: return null
+        return try {
+            val o = JSONObject(raw)
+            DlItem(o.getString("p"), o.getLong("s"), o.optLong("t"))
         } catch (_: Exception) {
-            emptyList()
+            null
         }
     }
 
     @Synchronized
     fun clearQueue() {
-        prefs.edit().remove(KEY_QUEUE).apply()
+        prefs.edit().remove(KEY_QUEUE).remove(KEY_ACTIVE).apply()
     }
 
     // -- internals ---------------------------------------------------------------------
 
-    private fun load(): List<Done> {
+    private fun load(): List<Done> =
+        loadRaw().map { Done(it.path, it.size, it.takenAt) }
+
+    private fun loadRaw(): List<DoneRaw> {
         val raw = prefs.getString(KEY_DONE, null) ?: return emptyList()
         return try {
             val a = JSONArray(raw)
             List(a.length()) { i ->
                 val o = a.getJSONObject(i)
-                Done(o.getString("p"), o.getLong("s"), o.optLong("t"))
+                DoneRaw(
+                    o.getString("p"), o.getLong("s"), o.optLong("t"),
+                    // v1 rows lack savedAt: treat as now (don't nuke
+                    // history on upgrade; they'll age out naturally).
+                    o.optLong("saved", System.currentTimeMillis()),
+                )
             }
         } catch (_: Exception) {
             emptyList()
         }
     }
 
-    private fun save(list: List<Done>) {
+    private fun saveRaw(list: List<DoneRaw>) {
         val a = JSONArray()
         for (d in list) {
-            a.put(JSONObject().put("p", d.path).put("s", d.size).put("t", d.takenAt))
+            a.put(
+                JSONObject().put("p", d.path).put("s", d.size)
+                    .put("t", d.takenAt).put("saved", d.savedAt)
+            )
         }
         prefs.edit().putString(KEY_DONE, a.toString()).apply()
     }
@@ -136,6 +184,7 @@ class TransferStore(ctx: Context) {
     companion object {
         private const val KEY_DONE = "done_v1"
         private const val KEY_QUEUE = "queue_v1"
+        private const val KEY_ACTIVE = "active_v1"
         private const val MAX_HISTORY = 5000
         private const val KEEP_DAYS = 90L
     }

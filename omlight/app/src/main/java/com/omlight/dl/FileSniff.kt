@@ -13,8 +13,11 @@ object FileSniff {
         if (head.size >= 3 && head[0] == 0xFF.toByte() && head[1] == 0xD8.toByte() &&
             head[2] == 0xFF.toByte()
         ) return Kind.JPEG
-        // ORF (TIFF-based): II*\0 or MM\0*.
+        // ORF: Olympus signatures IIRO / MMOR / IIRS. Very old bodies
+        // wrote plain TIFF (II*\0 / MM\0*); accept those too.
         if (head.size >= 4) {
+            val s = String(head, 0, 4, Charsets.US_ASCII)
+            if (s == "IIRO" || s == "MMOR" || s == "IIRS") return Kind.ORF
             val le = head[0] == 'I'.code.toByte() && head[1] == 'I'.code.toByte()
             val be = head[0] == 'M'.code.toByte() && head[1] == 'M'.code.toByte()
             if (le && head[2] == 42.toByte() && head[3] == 0.toByte()) return Kind.ORF

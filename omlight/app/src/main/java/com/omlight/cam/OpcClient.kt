@@ -20,6 +20,8 @@ class OpcClient(private val t: OpcTransport) {
 
     @Volatile var info: CameraInfo = CameraInfo(model = "")
         private set
+    /** Camera network for binding aux sockets (events/liveview). */
+    val network: android.net.Network? get() = t.network
     @Volatile private var useCammode = true // switch_cammode (new) vs switch_cameramode (AIR)
     @Volatile private var mode: Mode? = null
 
@@ -137,7 +139,7 @@ class OpcClient(private val t: OpcTransport) {
             if (events?.running == true) return
             val p = if (port > 0) port else freePort()
             t.getString("start_pushevent.cgi", "port" to p.toString())
-            val rx = EventReceiver(t.host)
+            val rx = EventReceiver(t.host, t.network)
             rx.start(p)
             events = rx
             eventPort = p
@@ -244,12 +246,37 @@ class OpcClient(private val t: OpcTransport) {
 
     // -- shooting ---------------------------------------------------------------
 
-    /** Single shot. Uses shutter-mode dialect when advertised, else rec+takemotion. */
+    /**
+     * True when the shutter dialect is usable. Advertised capability wins;
+     * when the camera gave no command list, probe once and pin the result.
+     * Never assume shutter on unknown bodies (a wrong guess leaves the
+     * camera in a mode we can't track).
+     */
+    private fun useShutter(): Boolean {
+        if (info.commands.isNotEmpty()) {
+            return info.supportsArg("switch_cammode", "mode", "shutter") &&
+                info.supports("exec_shutter")
+        }
+        shutterCache?.let { return it }
+        val ok = try {
+            t.getString("switch_cammode.cgi", "mode" to "shutter")
+            true
+        } catch (_: IOException) {
+            false
+        } finally {
+            // Probe leaves the body in shutter or errors out; either way
+            // force a tracked return to PLAY below.
+            mode = null
+        }
+        shutterCache = ok
+        if (ok) setMode(Mode.PLAY)
+        return ok
+    }
+
+    /** Single shot. Uses shutter-mode dialect when usable, else rec+takemotion. */
     @Throws(IOException::class)
     fun takePicture() {
-        if (info.supportsArg("switch_cammode", "mode", "shutter") ||
-            info.commands.isEmpty() && shutterProbe()
-        ) {
+        if (useShutter()) {
             shutterTake()
         } else {
             setMode(Mode.REC)
@@ -265,9 +292,7 @@ class OpcClient(private val t: OpcTransport) {
      */
     @Throws(IOException::class)
     fun takePictureAt(x: Int, y: Int) {
-        if (info.supportsArg("switch_cammode", "mode", "shutter") &&
-            info.commands.isNotEmpty()
-        ) {
+        if (useShutter()) {
             // Shutter dialect has no AF-point option; plain shot.
             shutterTake()
             return
@@ -282,21 +307,14 @@ class OpcClient(private val t: OpcTransport) {
 
     private var shutterCache: Boolean? = null
 
-    private fun shutterProbe(): Boolean {
-        shutterCache?.let { return it }
-        val ok = try {
-            t.getString("switch_cammode.cgi", "mode" to "shutter")
-            true
-        } catch (_: IOException) {
-            false
-        }
-        shutterCache = ok
-        return ok
-    }
-
     @Throws(IOException::class)
     private fun shutterTake() {
-        t.getString("switch_cammode.cgi", "mode" to "shutter")
+        synchronized(lock) {
+            t.getString("switch_cammode.cgi", "mode" to "shutter")
+            // Track the untracked mode so setMode(PLAY) below actually
+            // sends the command instead of short-circuiting.
+            mode = null
+        }
         try {
             checkOk(t.getString("exec_shutter.cgi", "com" to "1st2ndpush"), "shutter")
             Thread.sleep(400)

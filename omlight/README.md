@@ -69,6 +69,25 @@ python3 rtpcheck.py
 
 release ビルド (`CAM_HOST=192.168.0.10:80`) は実機カメラ AP 用。
 
+### リリース署名
+
+リポジトリに鍵は含まない。`app/` に以下を置くと自動署名される
+(どちらも gitignore 済み):
+
+```sh
+# 1. 鍵を作る (一度だけ)
+keytool -genkeypair -v -keystore app/release.keystore -alias omlight \
+  -keyalg RSA -keysize 2048 -validity 10000
+
+# 2. app/keystore.properties に書く
+storeFile=release.keystore
+storePassword=...
+keyAlias=omlight
+keyPassword=...
+```
+
+鍵なしの release は unsigned のまま出力される (実機テストは debug 署名で十分)。
+
 ## 未検証・既知の制限
 
 - ライブビューはエミュレータの UDP 制限で未検証 (RTP 組立はホストで検証済み)。

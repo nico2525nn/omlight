@@ -1,7 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Optional release signing: drop `release.keystore` + `keystore.properties`
+// (both git-ignored, see README) next to this file to sign releases.
+val keystoreProps = Properties().apply {
+    val f = file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -14,6 +23,17 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+    }
+
+    if (keystoreProps.containsKey("storeFile")) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(keystoreProps["storeFile"] as String)
+                storePassword = keystoreProps["storePassword"] as String
+                keyAlias = keystoreProps["keyAlias"] as String
+                keyPassword = keystoreProps["keyPassword"] as String
+            }
+        }
     }
 
     buildFeatures {
@@ -32,10 +52,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Personal project: sign with the debug key so the APK installs
-            // on a handset as-is. Replace with a real keystore for any
-            // distribution.
-            signingConfig = signingConfigs.getByName("debug")
+            // Unsigned by default; auto-signs when `release` signingConfig
+            // exists (see keystore.properties above).
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
         debug {
             // Keep debug fast; no minification.

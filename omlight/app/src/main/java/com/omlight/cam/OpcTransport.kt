@@ -29,7 +29,7 @@ import okhttp3.Response
 class OpcTransport(
     val host: String = Opc.HOST,
     val port: Int = Opc.PORT,
-    network: Network? = null,
+    val network: Network? = null,
     readTimeoutMs: Long = 15_000,
 ) : Closeable {
 

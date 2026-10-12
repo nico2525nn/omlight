@@ -20,6 +20,16 @@ class FileSniffTest {
     }
 
     @Test
+    fun orfOlympusSignaturesMatch() {
+        for (sig in listOf("IIRO", "MMOR", "IIRS")) {
+            val head = sig.toByteArray(Charsets.US_ASCII) + ByteArray(60)
+            assertTrue("sig $sig", FileSniff.matches("P001.ORF", head))
+            // Must not validate as JPEG either.
+            assertFalse(FileSniff.matches("P001.JPG", head))
+        }
+    }
+
+    @Test
     fun errorPageRejected() {
         val html = "<html><body>404</body></html>".toByteArray()
         assertTrue(FileSniff.looksLikeError(html))
