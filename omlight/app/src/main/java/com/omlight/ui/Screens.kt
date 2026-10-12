@@ -6,10 +6,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -884,12 +881,17 @@ private fun ZoomHoldButton(label: String, dir: OpcClient.ZoomDir, vm: CamViewMod
         onClick = {},
         modifier = Modifier.size(56.dp)
             .pointerInput(dir) {
-                awaitEachGesture {
-                    awaitFirstDown()
-                    vm.zoomHold(dir, true)
-                    waitForUpOrCancellation()
-                    vm.zoomHold(dir, false)
-                }
+                detectTapGestures(
+                    onDoubleTap = { vm.zoomEnd(dir) },
+                    onPress = {
+                        vm.zoomHold(dir, true)
+                        try {
+                            awaitRelease()
+                        } finally {
+                            vm.zoomHold(dir, false)
+                        }
+                    },
+                )
             },
     ) {
         Text(label, style = MaterialTheme.typography.titleMedium)

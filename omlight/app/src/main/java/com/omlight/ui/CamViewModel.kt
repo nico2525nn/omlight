@@ -860,14 +860,14 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val c = client() ?: return@launch
             if (afPoint != null) {
-                withContext(Dispatchers.IO) { c.releaseAf() }
+                withContext(Dispatchers.IO) { c.releaseAfLock() }
                 afPoint = null
                 return@launch
             }
             val (w, h) = liveviewSize(c)
             val x = (fx.coerceIn(0f, 1f) * (w - 1)).toInt()
             val y = (fy.coerceIn(0f, 1f) * (h - 1)).toInt()
-            val ok = withContext(Dispatchers.IO) { c.assignAf(x, y) }
+            val ok = withContext(Dispatchers.IO) { c.assignAfLock(x, y) }
             if (ok) {
                 afPoint = fx to fy
                 statusMsg = "AFロックしました (もう一度タップで解除)"
@@ -895,6 +895,18 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 noteSuccess()
             } catch (e: Exception) {
                 if (start) statusMsg = "ズームに失敗: ${e.message}"
+            }
+        }
+    }
+
+    /** Jump zoom to the wide/tele end (double-tap on W/T). Best-effort. */
+    fun zoomEnd(dir: OpcClient.ZoomDir) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val c = client() ?: return@launch
+            if (!c.zoomEnd(dir)) {
+                statusMsg = "このレンズは端移動に対応していません"
+            } else {
+                noteSuccess()
             }
         }
     }

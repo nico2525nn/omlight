@@ -552,6 +552,29 @@ class OpcClient(private val t: OpcTransport) {
         }
     }
 
+    /**
+     * Jump zoom to the wide/tele end in one shot (*term move).
+     * Best-effort: returns false when unsupported (older bodies,
+     * non-power zooms). Detected from the command list.
+     */
+    fun zoomEnd(dir: ZoomDir): Boolean {
+        if (info.commands.isNotEmpty()) {
+            val want = if (dir == ZoomDir.TELE) "teleterm" else "wideterm"
+            if (!info.supportsArg("exec_takemisc", "move", want)) return false
+        }
+        return try {
+            setMode(Mode.REC)
+            val move = if (dir == ZoomDir.TELE) "teleterm" else "wideterm"
+            checkOk(
+                t.getString("exec_takemisc.cgi", "com" to "ctrlzoom", "move" to move),
+                "zoom",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
     @Throws(IOException::class)
     fun zoomStop(dir: ZoomDir) {
         if (zoomDialectNew()) {
@@ -685,6 +708,46 @@ class OpcClient(private val t: OpcTransport) {
         } catch (_: IOException) {
             false
         }
+    }
+
+    /**
+     * Lock AF+AE at the liveview coordinate (assignaflock), for bodies
+     * with AFL support (newer OM-D/OM). Falls back to assignAf when the
+     * command is missing. Best-effort.
+     */
+    fun assignAfLock(x: Int, y: Int): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemotion", "com", "assignaflock")
+        ) {
+            return assignAf(x, y)
+        }
+        return try {
+            setMode(Mode.REC)
+            val point = "%04dx%04d".format(x.coerceIn(0, 9999), y.coerceIn(0, 9999))
+            checkOk(
+                t.getString("exec_takemotion.cgi", "com" to "assignaflock", "point" to point),
+                "aflock",
+            )
+            true
+        } catch (_: IOException) {
+            assignAf(x, y)
+        }
+    }
+
+    /** Release an AFL lock (releaseaflock), else plain releaseAf. Best-effort. */
+    fun releaseAfLock(): Boolean {
+        if (info.commands.isNotEmpty() &&
+            info.supportsArg("exec_takemotion", "com", "releaseaflock")
+        ) {
+            try {
+                checkOk(
+                    t.getString("exec_takemotion.cgi", "com" to "releaseaflock"),
+                    "aflock",
+                )
+                return true
+            } catch (_: IOException) { /* fall through */ }
+        }
+        return releaseAf()
     }
 
     // -- power & capacity ----------------------------------------------------------------------------
