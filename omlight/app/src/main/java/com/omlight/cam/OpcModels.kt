@@ -38,6 +38,35 @@ data class CamEntry(
     val isRaw: Boolean get() = name.substringAfterLast('.', "").uppercase() == "ORF"
 }
 
+/**
+ * Thumbnail + display rotation.
+ *
+ * Camera 160x120 thumbnails carry NO EXIF of their own; orientation
+ * arrives out-of-band via the `X-Rotation-Info` response header
+ * (EXIF orientation values 1/3/6/8). This pair keeps bytes and
+ * rotation together from fetch through disk/memory cache to display.
+ * [degrees] is one of 0/90/180/270.
+ */
+data class Thumb(val jpeg: ByteArray, val degrees: Int) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is Thumb) return false
+        return degrees == other.degrees && jpeg.contentEquals(other.jpeg)
+    }
+
+    override fun hashCode(): Int = 31 * degrees + jpeg.contentHashCode()
+
+    companion object {
+        /** `X-Rotation-Info` header (EXIF 1/3/6/8) -> clockwise degrees. */
+        fun degreesFor(header: String?): Int = when (header?.trim()) {
+            "3" -> 180
+            "6" -> 90
+            "8" -> 270
+            else -> 0 // "1", missing, or unknown: upright
+        }
+    }
+}
+
 /** Camera identity from `get_caminfo.cgi` / `get_commandlist.cgi`. */
 data class CameraInfo(
     val model: String,

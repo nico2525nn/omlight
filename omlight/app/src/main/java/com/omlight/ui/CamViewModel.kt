@@ -12,6 +12,7 @@ import com.omlight.cam.CamSession
 import com.omlight.cam.EventReceiver
 import com.omlight.cam.LiveviewReceiver
 import com.omlight.cam.OpcClient
+import com.omlight.cam.Thumb
 import com.omlight.dl.DlItem
 import com.omlight.dl.DownloadService
 import android.app.Application
@@ -136,8 +137,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var recording: Boolean by mutableStateOf(false)
         private set
-    /** path -> JPEG bytes for grid thumbnails. Bounded: evicted on refresh. */
-    val thumbs = mutableStateMapOf<String, ByteArray>()
+    /** path -> thumbnail for grid cells. Bounded: evicted on refresh. */
+    val thumbs = mutableStateMapOf<String, Thumb>()
     private val thumbStore by lazy { ThumbStore(getApplication()) }
     /** Latest liveview JPEG, or null when stopped. */
     var liveFrame: ByteArray? by mutableStateOf(null)
@@ -616,9 +617,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     if (!thumbFetching.add(e.path)) return@launch
                     try {
                         if (thumbs.containsKey(e.path)) return@launch
-                        val jpeg = c.thumbnail(e.path)
-                        thumbStore.put(e.path, e.sizeBytes, jpeg)
-                        thumbs[e.path] = jpeg
+                        val thumb = c.thumbnail(e.path)
+                        thumbStore.put(e.path, e.sizeBytes, thumb)
+                        thumbs[e.path] = thumb
                     } finally {
                         thumbFetching.remove(e.path)
                     }
@@ -673,9 +674,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             thumbSem.acquire()
             try {
                 if (thumbs.containsKey(entry.path)) return@launch
-                val jpeg = c.thumbnail(entry.path)
-                thumbStore.put(entry.path, entry.sizeBytes, jpeg)
-                thumbs[entry.path] = jpeg
+                val thumb = c.thumbnail(entry.path)
+                thumbStore.put(entry.path, entry.sizeBytes, thumb)
+                thumbs[entry.path] = thumb
             } catch (_: Exception) { /* retry on next bind */ }
             finally {
                 thumbSem.release()
@@ -684,7 +685,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun thumbFor(path: String): ByteArray? = thumbs[path]
+    fun thumbFor(path: String): Thumb? = thumbs[path]
 
     fun download(paths: List<String>) {
         val items = entries.filter { it.path in paths }

@@ -244,13 +244,17 @@ class OpcClient(private val t: OpcTransport) {
         return out
     }
 
-    /** Thumbnail bytes (160x120 JPEG) for a grid cell. */
+    /**
+     * Thumbnail (160x120 JPEG) + display rotation for a grid cell.
+     * Orientation comes from the `X-Rotation-Info` response header
+     * (EXIF 1/3/6/8); the JPEG itself has no EXIF to read.
+     */
     @Throws(IOException::class)
-    fun thumbnail(path: String): ByteArray {
+    fun thumbnail(path: String): Thumb {
         ensureMode(Mode.PLAY)
         t.get("get_thumbnail.cgi", "DIR" to path).use { r ->
             if (!r.isSuccessful) throw OpcTransport.statusError(r, "thumbnail")
-            return r.body!!.bytes()
+            return Thumb(r.body!!.bytes(), Thumb.degreesFor(r.header("X-Rotation-Info")))
         }
     }
 

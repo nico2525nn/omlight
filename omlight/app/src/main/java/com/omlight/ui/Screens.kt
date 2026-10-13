@@ -103,6 +103,7 @@ import kotlinx.coroutines.withContext
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.omlight.cam.CamEntry
 import com.omlight.cam.OpcClient
+import com.omlight.cam.Thumb
 import com.omlight.dl.DownloadService
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
@@ -563,7 +564,7 @@ private fun PhotosTab(vm: CamViewModel) {
                             }
                             PhotoCell(
                                 entry = e,
-                                jpeg = vm.thumbFor(e.path),
+                                thumb = vm.thumbFor(e.path),
                                 selected = e.path in selected,
                                 selecting = selecting,
                                 saved = e.path in vm.savedPaths && e.path !in selected,
@@ -625,29 +626,35 @@ private fun PhotosTab(vm: CamViewModel) {
 
 @Composable
 private fun ThumbImage(
-    jpeg: ByteArray,
+    thumb: Thumb,
     desc: String,
     modifier: Modifier,
     scale: ContentScale = ContentScale.Crop,
 ) {
+    val jpeg = thumb.jpeg
     var bmp: ImageBitmap? by remember(jpeg) { mutableStateOf(null) }
-    var rot by remember(jpeg) { mutableStateOf(0f) }
+    // Header rotation wins: camera thumbnails carry no EXIF of their
+    // own, so per-bind EXIF reads always resolve to 0 here. EXIF
+    // fallback stays for direct-JPEG callers (detail previews).
+    var rot by remember(thumb) { mutableStateOf(thumb.degrees.toFloat()) }
     LaunchedEffect(jpeg) {
         withContext(Dispatchers.Default) {
             runCatching {
                 val b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
                 if (b != null) {
                     bmp = b.asImageBitmap()
-                    rot = when (androidx.exifinterface.media.ExifInterface(
-                        java.io.ByteArrayInputStream(jpeg)
-                    ).getAttributeInt(
-                        androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
-                        androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
-                    )) {
-                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                        else -> 0f
+                    if (thumb.degrees == 0) {
+                        rot = when (androidx.exifinterface.media.ExifInterface(
+                            java.io.ByteArrayInputStream(jpeg)
+                        ).getAttributeInt(
+                            androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
+                        )) {
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                            else -> 0f
+                        }
                     }
                 }
             }
@@ -665,7 +672,7 @@ private fun ThumbImage(
 @Composable
 private fun PhotoCell(
     entry: CamEntry,
-    jpeg: ByteArray?,
+    thumb: Thumb?,
     selected: Boolean,
     selecting: Boolean,
     saved: Boolean,
@@ -679,8 +686,8 @@ private fun PhotoCell(
             .combinedClickable(onClick = onTap, onLongClick = onLongPress),
     ) {
         Box(Modifier.fillMaxSize()) {
-            if (jpeg != null) {
-                ThumbImage(jpeg, entry.name, Modifier.fillMaxSize())
+            if (thumb != null) {
+                ThumbImage(thumb, entry.name, Modifier.fillMaxSize())
             } else {
                 Box(
                     Modifier.fillMaxSize()
@@ -1045,7 +1052,7 @@ private fun DetailSheet(vm: CamViewModel) {
             ) {
                 val jpeg = vm.detailJpeg
                 if (jpeg != null) {
-                    ThumbImage(jpeg, path, Modifier.fillMaxSize(), ContentScale.Fit)
+                    ThumbImage(Thumb(jpeg, 0), path, Modifier.fillMaxSize(), ContentScale.Fit)
                 } else {
                     CircularProgressIndicator()
                 }

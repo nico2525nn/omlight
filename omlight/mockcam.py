@@ -306,7 +306,11 @@ class H(BaseHTTPRequestHandler):
             if r is None:
                 self._send(404, "text/plain", b"no such file")
                 return
-            self._send(200, "image/jpeg", r["thumb"])
+            # Vary rotation like real rolls: portrait shots come back 6/8.
+            n = ROLL.index(r) if r in ROLL else 0
+            rot = ("6", "1", "8", "1")[n % 4]
+            self._send(200, "image/jpeg", r["thumb"],
+                        {"X-Rotation-Info": rot})
         elif p == "/get_screennail.cgi":
             r = find(get("DIR"))
             if r is None:
