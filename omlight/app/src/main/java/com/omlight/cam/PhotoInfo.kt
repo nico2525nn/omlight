@@ -148,6 +148,122 @@ object PhotoInfoParse {
         return PhotoInfo(cgi.rows + exif.rows.filter { it.first !in seen })
     }
 
+    /**
+     * Minimal TIFF/ORF IFD reader for original-file heads. ExifInterface
+     * cannot parse ORF; this extracts the shooting basics (model, exposure
+     * trio, ISO, focal length, date) from IFD0 + ExifIFD directly.
+     * Best-effort: any malformed structure returns what it got so far.
+     */
+    fun fromTiff(head: ByteArray): PhotoInfo {
+        val rows = ArrayList<Pair<String, String>>()
+        try {
+            if (head.size < 8) return PhotoInfo()
+            val le = when {
+                head[0] == 'I'.code.toByte() && head[1] == 'I'.code.toByte() -> true
+                head[0] == 'M'.code.toByte() && head[1] == 'M'.code.toByte() -> false
+                else -> return PhotoInfo()
+            }
+            fun u16(off: Int): Int {
+                if (off + 2 > head.size) return 0
+                val a = head[off].toInt() and 0xFF
+                val b = head[off + 1].toInt() and 0xFF
+                return if (le) a or (b shl 8) else (a shl 8) or b
+            }
+            fun u32(off: Int): Long {
+                if (off + 4 > head.size) return 0
+                val a = head[off].toInt() and 0xFF
+                val b = head[off + 1].toInt() and 0xFF
+                val c = head[off + 2].toInt() and 0xFF
+                val d = head[off + 3].toInt() and 0xFF
+                return if (le) {
+                    (a or (b shl 8) or (c shl 16) or (d shl 24)).toLong() and 0xFFFFFFFFL
+                } else {
+                    ((a shl 24) or (b shl 16) or (c shl 8) or d).toLong() and 0xFFFFFFFFL
+                }
+            }
+            // ORF header is "IIRO"/"MMOR"/"IIRS" + version, NOT standard
+            // TIFF magic: accept it and read IFD0 offset from [4..8) like
+            // normal TIFF. Plain TIFF (magic 42) works the same way.
+            val sig = head.copyOfRange(0, 4).toString(Charsets.US_ASCII)
+            val isOrf = sig == "IIRO" || sig == "MMOR" || sig == "IIRS"
+            if (!isOrf && u16(2) != 42) return PhotoInfo()
+            fun ascii(off: Long, len: Long): String? {
+                if (off < 0 || off + len > head.size || len <= 0 || len > 256) return null
+                val end = (off until off + len).firstOrNull { head[it.toInt()] == 0.toByte() }
+                    ?: (off + len)
+                if (end <= off) return null
+                return head.copyOfRange(off.toInt(), end.toInt())
+                    .toString(Charsets.US_ASCII).trim().takeIf { it.isNotEmpty() }
+            }
+            fun rational(off: Long): String? {
+                if (off < 0 || off + 8 > head.size) return null
+                val n = u32(off.toInt())
+                val d = u32(off.toInt() + 4)
+                if (d == 0L) return null
+                return "$n/$d"
+            }
+            // tag -> (type, count, valueOffset). Inline values (<5 bytes)
+            // live in the entry itself; ascii/rational need the offset.
+            fun readIfd(ifdOff: Long, want: Set<Int>): Map<Int, String> {
+                val out = HashMap<Int, String>()
+                if (ifdOff < 0 || ifdOff + 2 > head.size) return out
+                val n = u16(ifdOff.toInt()).coerceAtMost(200)
+                var p = ifdOff.toInt() + 2
+                repeat(n) {
+                    if (p + 12 > head.size) return out
+                    val tag = u16(p)
+                    val type = u16(p + 2)
+                    val count = u32(p + 4)
+                    val valOff = u32(p + 8)
+                    if (tag in want) {
+                        when (type) {
+                            2 -> ascii(valOff, count)?.let { out[tag] = it }
+                            3 -> out[tag] = if (le) {
+                                u16(p + 8).toString()
+                            } else {
+                                u16(p + 8).toString()
+                            }
+                            4 -> out[tag] = valOff.toString()
+                            5 -> if (count == 1L) rational(valOff)?.let { out[tag] = it }
+                            7 -> if (tag == 0x927C && count > 0) {
+                                // MakerNote blob: skip (Olympus-specific).
+                            }
+                        }
+                    }
+                    p += 12
+                }
+                return out
+            }
+            val ifd0 = u32(4)
+            // IFD0: model, datetime, ExifIFD pointer.
+            val base = readIfd(ifd0, setOf(0x010F, 0x0110, 0x0132, 0x8769))
+            base[0x0110]?.let { rows.add("カメラ" to it) }
+            base[0x010F]?.let { if (rows.none { r -> r.first == "カメラ" }) rows.add("メーカー" to it) }
+            base[0x0132]?.let { rows.add("撮影日時" to it) }
+            // ExifIFD: exposure trio + lens.
+            val exifOff = readIfd(ifd0, setOf(0x8769))[0x8769]?.toLongOrNull()
+            if (exifOff != null && exifOff > 0) {
+                val e = readIfd(
+                    exifOff,
+                    setOf(0x829A, 0x829D, 0x8827, 0x920A, 0x9201, 0x9202, 0x9204, 0xA002, 0xA003),
+                )
+                e[0x829D]?.let { rows.add("絞り" to "F${formatRational(it)}") }
+                e[0x829A]?.let { rows.add("シャッター" to formatShutter(it)) }
+                e[0x8827]?.let { rows.add("ISO" to it) }
+                e[0x920A]?.let { rows.add("焦点距離" to "${formatRational(it)}mm") }
+                e[0x9201]?.let { rows.add("露出補正" to "${formatRational(it)}EV") }
+                e[0x9202]?.let { rows.add("測光" to meteringName(it)) }
+                e[0x9204]?.let { rows.add("露出プログラム" to expProgName(it)) }
+                val w = e[0xA002]
+                val h = e[0xA003]
+                if (w != null && h != null && w != "0" && h != "0") {
+                    rows.add("サイズ" to "${w}×${h}")
+                }
+            }
+        } catch (_: Exception) { /* partial rows stand */ }
+        return PhotoInfo(rows)
+    }
+
     // -- EXIF enum names ---------------------------------------------------------------
 
     /** "1/250" stays, "0.00625" -> "1/160", "2" -> "2s". */

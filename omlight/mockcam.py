@@ -87,9 +87,26 @@ def add_photo(tag: str, folder: str = "/DCIM/100OLYMP", raw: bool = False) -> di
     ext = "ORF" if raw else "JPG"
     name = f"P{n:06d}.{ext}"
     if raw:
-        # Synthetic ORF: real Olympus header + padding (NOT a valid raw,
-        # but byte-identical in the magic the app verifies).
-        full = b"IIRO" + bytes(44000)
+        # Synthetic ORF: real "IIRO" header + minimal IFD0/ExifIFD so the
+        # app's TIFF fallback parser has something to read (NOT a valid raw).
+        import struct as _st
+        blob = bytearray(44004)
+        blob[0:8] = b"IIRO\x08\x00\x00\x00"  # IIRO + IFD0@8
+        # IFD0 @8: Model + ExifIFD ptr.
+        _st.pack_into("<H", blob, 8, 2)
+        _st.pack_into("<HHI", blob, 10, 0x0110, 2, 6)
+        _st.pack_into("<I", blob, 18, 100)
+        _st.pack_into("<HHI", blob, 22, 0x8769, 4, 1)
+        _st.pack_into("<I", blob, 30, 120)
+        blob[100:106] = b"E-M10\x00"
+        # ExifIFD @120: FNumber 28/10 + ISO 200.
+        _st.pack_into("<H", blob, 120, 2)
+        _st.pack_into("<HHI", blob, 122, 0x829D, 5, 1)
+        _st.pack_into("<I", blob, 130, 150)
+        _st.pack_into("<HHI", blob, 134, 0x8827, 3, 1)
+        _st.pack_into("<H", blob, 142, 200)
+        _st.pack_into("<II", blob, 150, 28, 10)
+        full = bytes(blob)
     else:
         full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37, exif=True)
     ROLL.append({
@@ -265,9 +282,19 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "text/xml",
                         b'<?xml version="1.0"?>\n<connectmode>private</connectmode>\n')
         elif p == "/get_commandlist.cgi":
-            self._xml(COMMANDLIST)
+            if ARGS.em10:
+                out = COMMANDLIST.replace(
+                    '<cgi name="get_exif"><http_method type="get">\n'
+                    '<cmd1 name="DIR"/>\n</http_method></cgi>\n', "")
+                out = out.replace(
+                    '<cgi name="get_screennail"><http_method type="get">\n'
+                    '<cmd1 name="DIR"/>\n</http_method></cgi>\n', "")
+                self._xml(out)
+            else:
+                self._xml(COMMANDLIST)
         elif p == "/get_caminfo.cgi":
-            self._xml("<model>E-Mock1</model><maker>MockCam</maker>")
+            self._xml("<model>E-Mock1</model><maker>MockCam</maker>" if not ARGS.em10 else
+                      "<model>E-M10</model><maker>OLYMPUS IMAGING CORP.</maker>")
         elif p == "/switch_cammode.cgi":
             MODE["cur"] = get("mode", "play")
             evt(2, 201)  # operation mode changed
@@ -320,6 +347,9 @@ class H(BaseHTTPRequestHandler):
             self._send(200, "image/jpeg", r["thumb"],
                         {"X-Rotation-Info": rot})
         elif p == "/get_screennail.cgi":
+            if ARGS.em10:
+                self._send(404, "text/plain", b"no such cgi")
+                return
             r = find(get("DIR"))
             if r is None:
                 self._send(404, "text/plain", b"no such file")
@@ -330,8 +360,19 @@ class H(BaseHTTPRequestHandler):
             if r is None:
                 self._send(404, "text/plain", b"no such file")
                 return
-            self._send(200, "image/jpeg", r["screen"])
+            if ARGS.em10 and "screen_stripped" not in r:
+                # Re-encode without EXIF: E-M10 previews carry none.
+                from PIL import Image as _I
+                import io as _io
+                img = _I.open(_io.BytesIO(r["screen"]))
+                buf = _io.BytesIO()
+                img.save(buf, "JPEG", quality=85)
+                r["screen_stripped"] = buf.getvalue()
+            self._send(200, "image/jpeg", r.get("screen_stripped", r["screen"]))
         elif p == "/get_exif.cgi":
+            if ARGS.em10:
+                self._send(404, "text/plain", b"no such cgi")
+                return
             r = find(get("DIR"))
             if r is None:
                 self._send(404, "text/plain", b"no such file")
@@ -577,6 +618,10 @@ def main() -> None:
     # Slow originals (ms per 16KB chunk): exercises progress UI +
     # interrupt/resume paths that finish instantly at full speed.
     ap.add_argument("--slow", type=int, default=0)
+    # E-M10 emulation: no get_exif/screennail in commandlist, previews
+    # strip EXIF, get_exif.cgi answers 404. Forces the app through the
+    # original-head fallback path.
+    ap.add_argument("--em10", action="store_true")
     ARGS = ap.parse_args()
     seed_roll(ARGS.seed)
     srv = ThreadingHTTPServer((HOST, ARGS.port), H)

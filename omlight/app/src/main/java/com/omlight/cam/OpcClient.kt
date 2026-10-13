@@ -313,23 +313,26 @@ class OpcClient(private val t: OpcTransport) {
             PhotoInfo()
         }
         var cgi = PhotoInfo()
-        if (info.commands.isEmpty() || info.supports("get_exif")) {
-            cgi = try {
-                t.get("get_exif.cgi", "DIR" to path).use { r ->
-                    if (!r.isSuccessful) throw java.io.IOException("get_exif ${r.code}")
-                    val bytes = r.body!!.bytes()
-                    // XML info or bare EXIF/JPEG blob: sniff first.
-                    val head = bytes.take(512).toByteArray()
-                    val looksXml = head.toString(Charsets.UTF_8).trimStart().startsWith("<")
-                    if (looksXml) {
-                        PhotoInfoParse.fromCgi(OpcParse.xmlFlat(bytes.toString(Charsets.UTF_8)))
-                    } else {
-                        PhotoInfoParse.fromJpeg(bytes)
-                    }
+        // get_exif: try even when unadvertised. Old bodies (E-M10) omit it
+        // from commandlist but still answer; 404/empty just falls through.
+        cgi = try {
+            t.get("get_exif.cgi", "DIR" to path).use { r ->
+                if (!r.isSuccessful) throw java.io.IOException("get_exif ${r.code}")
+                val bytes = r.body!!.bytes()
+                if (bytes.isEmpty() || bytes.size > 512 * 1024) throw java.io.IOException(
+                    "get_exif bad size ${bytes.size}"
+                )
+                // XML info or bare EXIF/JPEG blob: sniff the raw bytes
+                // (never decode binary as UTF-8: the XML check must not
+                // crash or misfire on EXIF data).
+                if (looksLikeXml(bytes)) {
+                    PhotoInfoParse.fromCgi(OpcParse.xmlFlat(bytes.toString(Charsets.UTF_8)))
+                } else {
+                    PhotoInfoParse.fromJpeg(bytes)
                 }
-            } catch (_: Exception) {
-                PhotoInfo()
             }
+        } catch (_: Exception) {
+            PhotoInfo()
         }
         if (cgi.isEmpty && (info.commands.isEmpty() || info.supports("get_imageinfo"))) {
             cgi = try {
@@ -347,14 +350,70 @@ class OpcClient(private val t: OpcTransport) {
             try {
                 t.getRangeTo(path.trimStart('/'), 0, 65535).use { r ->
                     if (r.isSuccessful) {
-                        val head = r.body!!.bytes()
-                        val headExif = PhotoInfoParse.fromJpeg(head)
+                        // Cap the read: a body that ignores Range answers
+                        // 200 with the whole multi-MB file. EXIF is in the
+                        // first 64KB; anything past that is dead weight.
+                        val head = r.body!!.byteStream().use { src ->
+                            val buf = ByteArray(65536)
+                            var off = 0
+                            while (off < buf.size) {
+                                val n = src.read(buf, off, buf.size - off)
+                                if (n < 0) break
+                                off += n
+                            }
+                            buf.copyOf(off)
+                        }
+                        val headExif = if (isTiffHead(head)) {
+                            // ORF/TIFF original: ExifInterface can't parse
+                            // it, use the minimal IFD reader.
+                            PhotoInfoParse.fromTiff(head)
+                        } else {
+                            PhotoInfoParse.fromJpeg(head)
+                        }
                         if (headExif.rows.size > exif.rows.size) exif = headExif
                     }
                 }
             } catch (_: Exception) { /* keep preview EXIF */ }
         }
         return PhotoInfoParse.merge(cgi, exif)
+    }
+
+    /** True for TIFF/ORF heads (II/MM byte order + magic or ORF sig). */
+    private fun isTiffHead(h: ByteArray): Boolean {
+        if (h.size < 8) return false
+        val ii = h[0] == 'I'.code.toByte() && h[1] == 'I'.code.toByte()
+        val mm = h[0] == 'M'.code.toByte() && h[1] == 'M'.code.toByte()
+        if (!ii && !mm) return false
+        // Real ORF: "IIRO"/"MMOR"/"IIRS" instead of TIFF magic 42.
+        val sig = h.copyOfRange(0, 4).toString(Charsets.US_ASCII)
+        if (sig == "IIRO" || sig == "MMOR" || sig == "IIRS") return true
+        val magic = if (ii) {
+            (h[2].toInt() and 0xFF) or ((h[3].toInt() and 0xFF) shl 8)
+        } else {
+            ((h[2].toInt() and 0xFF) shl 8) or (h[3].toInt() and 0xFF)
+        }
+        return magic == 42
+    }
+
+    /**
+     * True when [bytes] look like an XML document: optional BOM/whitespace
+     * then '<'. Byte-level: never decodes binary as text.
+     */
+    private fun looksLikeXml(bytes: ByteArray): Boolean {
+        var i = 0
+        // UTF-8 BOM?
+        if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() &&
+            bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()
+        ) {
+            i = 3
+        }
+        while (i < bytes.size && i < 64) {
+            val b = bytes[i].toInt() and 0xFF
+            if (b == '<'.code) return true
+            if (b != ' '.code && b != '\t'.code && b != '\r'.code && b != '\n'.code) return false
+            i++
+        }
+        return false
     }
 
     /** ensureMode that never throws (info fetch is best-effort). */
