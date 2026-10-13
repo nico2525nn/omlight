@@ -38,8 +38,8 @@ object PhotoInfoParse {
                 rows.add("撮影日時" to it.replaceFirst(" ", " ").trim())
             }
             // Exposure trio.
-            val f = tag(ExifInterface.TAG_F_NUMBER)?.let { "F$it" }
-            val ss = tag(ExifInterface.TAG_EXPOSURE_TIME)?.let { "${it}s" }
+            val f = tag(ExifInterface.TAG_F_NUMBER)?.let { "F${formatRational(it)}" }
+            val ss = tag(ExifInterface.TAG_EXPOSURE_TIME)?.let { formatShutter(it) }
             val iso = tag(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY)
                 ?: tag(ExifInterface.TAG_ISO_SPEED_RATINGS)
             listOfNotNull(
@@ -149,6 +149,17 @@ object PhotoInfoParse {
     }
 
     // -- EXIF enum names ---------------------------------------------------------------
+
+    /** "1/250" stays, "0.00625" -> "1/160", "2" -> "2s". */
+    private fun formatShutter(v: String): String {
+        val t = v.trim()
+        if (t.contains('/')) return "${t}s"
+        val f = t.toDoubleOrNull() ?: return "${t}s"
+        if (f >= 1.0) return "${formatRational(t)}s"
+        if (f <= 0.0) return t
+        val denom = (1.0 / f).toInt()
+        return "1/$denom"
+    }
 
     /** "2500/100" -> "25", "1/250" stays, plain numbers pass through. */
     private fun formatRational(v: String): String {

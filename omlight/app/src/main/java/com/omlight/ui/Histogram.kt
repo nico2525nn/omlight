@@ -39,7 +39,9 @@ object Histogram {
             val sample = (longest / 256).coerceAtLeast(1)
             val opts = BitmapFactory.Options().apply {
                 inSampleSize = sample
-                inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+                // 8888, not 565: 565 quantizes to 32/64 levels and leaves
+                // every other bin at zero (comb teeth on the graph).
+                inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
             }
             val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts)
                 ?: return@withContext empty()
@@ -67,8 +69,29 @@ object Histogram {
                     if (cr == 0 && cg == 0 && cb == 0) black++
                     if (cr == 255 && cg == 255 && cb == 255) white++
                 }
+                // Box-blur the bins (radius 1): kills single-bin spikes
+                // from JPEG ringing so the line reads as a curve.
+                fun smooth(d: IntArray): IntArray {
+                    val o = IntArray(BINS)
+                    for (i in 0 until BINS) {
+                        var s = d[i]
+                        var n = 1
+                        if (i > 0) {
+                            s += d[i - 1]; n++
+                        }
+                        if (i + 1 < BINS) {
+                            s += d[i + 1]; n++
+                        }
+                        o[i] = s / n
+                    }
+                    return o
+                }
+                val sr = smooth(r)
+                val sg = smooth(g)
+                val sb = smooth(b)
+                val sy = smooth(y)
                 val n = px.size.toFloat().coerceAtLeast(1f)
-                Rgb(r, g, b, y, maxOf(r.max(), g.max(), b.max(), y.max()), black / n, white / n)
+                Rgb(sr, sg, sb, sy, maxOf(sr.max(), sg.max(), sb.max(), sy.max()), black / n, white / n)
             } finally {
                 if (!bmp.isRecycled) bmp.recycle()
             }
