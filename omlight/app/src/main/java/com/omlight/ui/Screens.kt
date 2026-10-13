@@ -916,6 +916,43 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
             }
             QuickProp(vm, "wbvalue", "WB")
         }
+        Spacer(Modifier.height(8.dp))
+        // Interval shoot: preset chips or stop while running.
+        if (vm.intervalLeft > 0) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "残り ${vm.intervalLeft} 枚",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = vm::stopInterval) { Text("中止") }
+            }
+        } else {
+            var count by remember { mutableStateOf(10) }
+            var secs by remember { mutableStateOf(5) }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("連写", style = MaterialTheme.typography.bodySmall)
+                FilterChip(
+                    selected = false,
+                    onClick = { count = if (count == 10) 30 else if (count == 30) 100 else 10 },
+                    label = { Text("$count 枚") },
+                )
+                FilterChip(
+                    selected = false,
+                    onClick = { secs = if (secs == 5) 10 else if (secs == 10) 30 else 5 },
+                    label = { Text("$secs 秒") },
+                )
+                Button(onClick = { vm.startInterval(count, secs) }) { Text("開始") }
+            }
+        }
     }
 }
 

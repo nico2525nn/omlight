@@ -142,6 +142,10 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var selfTimerSupported: Boolean by mutableStateOf(false)
         private set
+    /** Interval shoot: remaining shots, 0 = idle. */
+    var intervalLeft: Int by mutableStateOf(0)
+        private set
+    private var intervalJob: Job? = null
     /** path -> thumbnail for grid cells. Bounded: evicted on refresh. */
     val thumbs = mutableStateMapOf<String, Thumb>()
     private val thumbStore by lazy { ThumbStore(getApplication()) }
@@ -989,6 +993,50 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 if (wasLive && shootVisible) startLive()
             }
         }
+    }
+
+    /**
+     * Interval shoot: [count] shots every [intervalSec], app-side timer
+     * like stock (no body interval CGI exists). Stops early on failure.
+     */
+    fun startInterval(count: Int, intervalSec: Int) {
+        if (intervalJob != null) return
+        intervalJob = viewModelScope.launch {
+            val c = client() ?: return@launch
+            intervalLeft = count
+            val wasLive = liveRunning
+            if (wasLive) stopLive()
+            try {
+                repeat(count) { i ->
+                    if (!isActive) return@launch
+                    captureState = "インターバル ${i + 1}/$count"
+                    try {
+                        withContext(Dispatchers.IO) { c.takePicture() }
+                        noteSuccess()
+                    } catch (e: Exception) {
+                        statusMsg = "インターバル中断 (${i + 1}/$count): ${shootWhy(e)}"
+                        return@launch
+                    }
+                    intervalLeft = count - i - 1
+                    if (i + 1 < count) delay(intervalSec * 1000L)
+                }
+                statusMsg = "インターバル完了 ($count 枚)"
+                delay(800)
+                refresh()
+            } finally {
+                intervalLeft = 0
+                captureState = null
+                intervalJob = null
+                if (wasLive && shootVisible) startLive()
+            }
+        }
+    }
+
+    fun stopInterval() {
+        intervalJob?.cancel()
+        intervalJob = null
+        intervalLeft = 0
+        captureState = null
     }
 
     /** Human cause for a shoot failure (timeout vs AF vs busy). */
