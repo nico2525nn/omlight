@@ -718,6 +718,147 @@ class OpcClient(private val t: OpcTransport) {
         }
     }
 
+    // -- takemisc extras (dex-verified, best-effort) ------------------------------------------
+
+    /**
+     * Digital zoom nudge (`digitalzoomshift`). Direction strings follow
+     * the stock app (tele/wide). False when unsupported. Best-effort.
+     */
+    fun digitalZoomShift(tele: Boolean): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "digitalzoomshift")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "digitalzoomshift",
+                    "dir" to if (tele) "tele" else "wide",
+                ),
+                "digitalzoom",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Super-macro AF lock/unlock. False when unsupported. Best-effort.
+     */
+    fun supermacroAfLock(lock: Boolean): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "supermacroaflock")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "supermacroaflock",
+                    "func" to if (lock) "lock" else "release",
+                ),
+                "supermacro",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Super-macro MF nudge. False when unsupported. Best-effort.
+     */
+    fun supermacroMf(tele: Boolean): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "supermacromfinaflock")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "supermacromfinaflock",
+                    "move" to if (tele) "telemove" else "widemove",
+                ),
+                "supermacromf",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * One-touch light on/off (TG macro lights, dex-verified param).
+     * False when unsupported. Best-effort.
+     */
+    fun oneTouchLight(on: Boolean): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "OneTouchLight")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            checkOk(
+                t.getString(
+                    "exec_takemisc.cgi", "com" to "OneTouchLight",
+                    "switch" to if (on) "on" else "off",
+                ),
+                "light",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Movie-through (live HDMI-style preview) on/off. False when
+     * unsupported. Best-effort.
+     */
+    fun movieThrough(on: Boolean): Boolean {
+        val com = if (on) "MovieThroughStart" else "MovieThroughStop"
+        if (info.commands.isNotEmpty() && !info.supportsArg("exec_takemisc", "com", com)) {
+            return false
+        }
+        return try {
+            setMode(Mode.REC)
+            checkOk(t.getString("exec_takemisc.cgi", "com" to com), "moviethrough")
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Movie settings snapshot (`GetMovieSetting`). Empty when unsupported.
+     */
+    fun movieSetting(): Map<String, String> {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "GetMovieSetting")
+        ) return emptyMap()
+        return try {
+            OpcParse.xmlFlat(t.getString("exec_takemisc.cgi", "com" to "GetMovieSetting"))
+                .filterValues { it.isNotBlank() }
+        } catch (_: IOException) {
+            emptyMap()
+        }
+    }
+
+    /**
+     * Short-movie album info (`GetShortMoviesAlbumInfo`). Empty when
+     * unsupported. Best-effort.
+     */
+    fun shortMoviesAlbum(): Map<String, String> {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemisc", "com", "GetShortMoviesAlbumInfo")
+        ) return emptyMap()
+        return try {
+            OpcParse.xmlFlat(t.getString("exec_takemisc.cgi", "com" to "GetShortMoviesAlbumInfo"))
+                .filterValues { it.isNotBlank() }
+        } catch (_: IOException) {
+            emptyMap()
+        }
+    }
+
     // -- administration (playmaintenance mode) ---------------------------------------------
 
     /**
@@ -925,6 +1066,264 @@ class OpcClient(private val t: OpcTransport) {
         }
     }
 
+    // -- movie trim + stream (dex-verified, best-effort) ----------------------------------------
+
+    /**
+     * Start a server-side movie trim+resize job. [startMs]/[stopMs] are
+     * millisecond timestamps; [resize] is the body-specific resize token
+     * (opaque string). Returns false when unsupported. Poll
+     * [trimStatus] until it completes, then fetch the result per the
+     * body's documented flow.
+     */
+    fun movieTrimStart(path: String, startMs: Long, stopMs: Long, resize: String): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("exec_movietrimresize")) return false
+        return try {
+            val body = t.getString(
+                "exec_movietrimresize.cgi", "DIR" to path,
+                "starttimestamp" to startMs.toString(),
+                "stoptimestamp" to stopMs.toString(),
+                "resizeparam" to resize,
+            )
+            checkOk(body, "trim")
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Trim job status (`get_trimresizeprocstatus`). Empty when unsupported. */
+    fun trimStatus(): Map<String, String> = flatInfo("get_trimresizeprocstatus")
+
+    /** Cancel a running trim job. False when unsupported. Best-effort. */
+    fun trimCancel(path: String): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("cancel_trimresize")) return false
+        return try {
+            checkOk(t.getString("cancel_trimresize.cgi", "DIR" to path), "trim cancel")
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Stream session info (`get_moviestreaminfo`). Empty when unsupported. */
+    fun movieStreamInfo(): Map<String, String> = flatInfo("get_moviestreaminfo")
+
+    /**
+     * Arm a movie stream (`ready_moviestream`). Stock passes
+     * `videomethod=udp&videoport=` (+ audio over tcp when wanted).
+     * Returns the body's ack map. Empty when unsupported. Best-effort.
+     */
+    fun movieStreamReady(videoPort: Int, audioPort: Int? = null): Map<String, String> {
+        if (info.commands.isNotEmpty() && !info.supports("ready_moviestream")) {
+            return emptyMap()
+        }
+        return try {
+            val body = if (audioPort != null) {
+                t.getString(
+                    "ready_moviestream.cgi", "audiomethod" to "tcp",
+                    "videomethod" to "udp", "audioport" to audioPort.toString(),
+                    "videoport" to videoPort.toString(),
+                )
+            } else {
+                t.getString(
+                    "ready_moviestream.cgi", "videomethod" to "udp",
+                    "videoport" to videoPort.toString(),
+                )
+            }
+            OpcParse.xmlFlat(body).filterValues { it.isNotBlank() }
+        } catch (_: IOException) {
+            emptyMap()
+        }
+    }
+
+    /**
+     * Start streaming [path] (`start_moviestream[.ts]`). Returns the raw
+     * ack body (URL/session per body). Null when unsupported. Best-effort.
+     */
+    fun movieStreamStart(path: String, ts: Boolean = false): String? {
+        val cmd = if (ts) "start_moviestreamts" else "start_moviestream"
+        if (info.commands.isNotEmpty() && !info.supports(cmd)) return null
+        return try {
+            t.getString("$cmd.cgi", "DIR" to path)
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /** Stop a stream (`stop_moviestream` / `exit_moviestream`). Best-effort. */
+    fun movieStreamStop() {
+        for (cmd in listOf("stop_moviestream", "exit_moviestream")) {
+            if (info.commands.isNotEmpty() && !info.supports(cmd)) continue
+            try {
+                t.getString("$cmd.cgi")
+            } catch (_: IOException) { /* best-effort */ }
+        }
+    }
+
+    // -- myset backup/restore (dex-verified flow, best-effort) -----------------------------------
+    // Stock flow, backup: request_getmysetdata(mode,kind=current) ->
+    // get_mysetdatasize(kind=current) -> get_partialmysetdata(kind,offset,size)*
+    // Restore: set_mysetdatasize(size) -> send_partialmysetdata(offset,size)*
+    // -> request_restoremysetdata(action=restore).
+
+    /** Begin a myset download session. False when unsupported. */
+    fun mysetBeginGet(mode: String): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("request_getmysetdata")) return false
+        return try {
+            checkOk(
+                t.getString("request_getmysetdata.cgi", "mode" to mode, "kind" to "current"),
+                "myset get",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Myset blob size in bytes, -1 when unsupported/unknown. */
+    fun mysetSize(): Long {
+        if (info.commands.isNotEmpty() && !info.supports("get_mysetdatasize")) return -1
+        return try {
+            val m = OpcParse.xmlFlat(t.getString("get_mysetdatasize.cgi", "kind" to "current"))
+            m.values.firstNotNullOfOrNull { it.toLongOrNull() } ?: -1
+        } catch (_: IOException) {
+            -1
+        }
+    }
+
+    /** One myset chunk. Null when unsupported/failed. */
+    fun mysetChunk(offset: Long, size: Int): ByteArray? {
+        if (info.commands.isNotEmpty() && !info.supports("get_partialmysetdata")) return null
+        return try {
+            t.get(
+                "get_partialmysetdata.cgi", "kind" to "current",
+                "offset" to offset.toString(), "size" to size.toString(),
+            ).use { r ->
+                if (!r.isSuccessful) null else r.body!!.bytes()
+            }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /** Myset display name for [mode]. Null when unsupported. */
+    fun mysetName(mode: String): String? {
+        if (info.commands.isNotEmpty() && !info.supports("get_mysetname")) return null
+        return try {
+            val m = OpcParse.xmlFlat(t.getString("get_mysetname.cgi", "mode" to mode))
+            m.values.firstOrNull { it.isNotBlank() }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /** Declare an incoming restore blob of [size] bytes. False when refused. */
+    fun mysetBeginRestore(size: Long): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("set_mysetdatasize")) return false
+        return try {
+            checkOk(
+                t.getString("set_mysetdatasize.cgi", "size" to size.toString()),
+                "myset size",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Upload one restore chunk at [offset]. False on failure. */
+    fun mysetSendChunk(offset: Long, chunk: ByteArray): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("send_partialmysetdata")) return false
+        return try {
+            t.post(
+                "send_partialmysetdata.cgi",
+                chunk.toString(Charsets.ISO_8859_1),
+                "offset" to offset.toString(), "size" to chunk.size.toString(),
+            ).use { r ->
+                r.isSuccessful
+            }
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Commit a restore (`action=restore`). False when refused. */
+    fun mysetCommitRestore(): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("request_restoremysetdata")) return false
+        return try {
+            checkOk(
+                t.getString("request_restoremysetdata.cgi", "action" to "restore"),
+                "myset restore",
+            )
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    // -- GPS attach + camera log fetch (dex-verified, best-effort) ----------------------------------
+
+    /**
+     * Attach GPS to one file's EXIF (`req_attachexifgps`, POST body =
+     * XML with lat/lon). Stock posts XML; exact schema varies, so the
+     * caller supplies decimal degrees and we emit the common shape.
+     * False when unsupported/refused.
+     */
+    fun attachGps(path: String, lat: Double, lon: Double): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("req_attachexifgps")) return false
+        return try {
+            val xml = "<?xml version=\"1.0\"?>\r\n<gps>\r\n" +
+                "<dir>$path</dir>\r\n<lat>$lat</lat>\r\n<lon>$lon</lon>\r\n</gps>\r\n"
+            t.post("req_attachexifgps.cgi", xml).use { r -> r.isSuccessful }
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Append a GPS log entry (`req_storegpsinfo?mode=append`, POST body =
+     * NMEA-ish text). False when unsupported. Best-effort.
+     */
+    fun storeGpsLog(nmea: String): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("req_storegpsinfo")) return false
+        return try {
+            t.post("req_storegpsinfo.cgi", nmea, "mode" to "append").use { r ->
+                r.isSuccessful
+            }
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * One camera-log chunk (`get_partialcameralogdata?offset=&size=`).
+     * Null when unsupported/failed. Best-effort.
+     */
+    fun cameraLogChunk(offset: Long, size: Int): ByteArray? {
+        if (info.commands.isNotEmpty() && !info.supports("get_partialcameralogdata")) return null
+        return try {
+            t.get(
+                "get_partialcameralogdata.cgi",
+                "offset" to offset.toString(), "size" to size.toString(),
+            ).use { r ->
+                if (!r.isSuccessful) null else r.body!!.bytes()
+            }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    /**
+     * Reboot the camera body. Like powerOff, the AP dies with it; UI
+     * must disconnect. Never throws (transport death is the success
+     * signal on some bodies).
+     */
+    fun reboot() {
+        try {
+            t.get("exec_reboot.cgi").close()
+        } catch (_: IOException) { /* expected on some bodies */ }
+    }
+
     /**
      * Active media slot on dual-slot bodies (`get_playtargetslot`).
      * -1 when unsupported/unknown. Best-effort.
@@ -963,6 +1362,55 @@ class OpcClient(private val t: OpcTransport) {
             true
         } catch (_: IOException) {
             false
+        }
+    }
+
+    // -- read-only status/info (dex-verified, best-effort) ----------------------------
+
+    /** Media mount state (`check_mountmedia`). Empty when unsupported. */
+    fun mountMedia(): Map<String, String> = flatInfo("check_mountmedia")
+
+    /** DCF file count info (`get_dcffilenum`). Empty when unsupported. */
+    fun dcfFileNum(): Map<String, String> = flatInfo("get_dcffilenum")
+
+    /** GPS unit divisor (`get_gpsdivunit`). Empty when unsupported. */
+    fun gpsDivUnit(): Map<String, String> = flatInfo("get_gpsdivunit")
+
+    /** GPS recording state (`check_gpsrecording`). Empty when unsupported. */
+    fun gpsRecording(): Map<String, String> = flatInfo("check_gpsrecording")
+
+    /** SNS recording state (`check_snsrecording`). Empty when unsupported. */
+    fun snsRecording(): Map<String, String> = flatInfo("check_snsrecording")
+
+    /** GPS log list (`get_gpsloglist`). Empty when unsupported. */
+    fun gpsLogList(): Map<String, String> = flatInfo("get_gpsloglist")
+
+    /** SNS log list (`get_snsloglist`). Empty when unsupported. */
+    fun snsLogList(): Map<String, String> = flatInfo("get_snsloglist")
+
+    /** A-GPS info (`get_agpsinfo`). Empty when unsupported. */
+    fun agpsInfo(): Map<String, String> = flatInfo("get_agpsinfo")
+
+    /** Camera log summary (`get_cameraloginfo`). Empty when unsupported. */
+    fun cameraLogInfo(): Map<String, String> = flatInfo("get_cameraloginfo")
+
+    /** MySet backup state (`get_mysetbackupstate`). Empty when unsupported. */
+    fun mysetBackupState(): Map<String, String> = flatInfo("get_mysetbackupstate")
+
+    /** MySet restore state (`get_mysetrestorestate`). Empty when unsupported. */
+    fun mysetRestoreState(): Map<String, String> = flatInfo("get_mysetrestorestate")
+
+    /** MySet data mode kind (`get_mysetdatamodekind`). Empty when unsupported. */
+    fun mysetDataModeKind(): Map<String, String> = flatInfo("get_mysetdatamodekind")
+
+    /** Generic no-arg flat-XML info fetch with capability gate. */
+    private fun flatInfo(cmd: String): Map<String, String> {
+        if (info.commands.isNotEmpty() && !info.supports(cmd)) return emptyMap()
+        return try {
+            OpcParse.xmlFlat(t.getString("$cmd.cgi"))
+                .filterValues { it.isNotBlank() }
+        } catch (_: IOException) {
+            emptyMap()
         }
     }
 

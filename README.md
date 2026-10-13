@@ -46,3 +46,16 @@ python3 camprobe.py --deep           # カメラ設定も取得
 stdlib のみ、pip 不要。
 
 詳細は [`OMLight_OPC_Protocol_Guide_JA.md`](OMLight_OPC_Protocol_Guide_JA.md)。
+
+## 意図的に入れない CGI
+
+純正 APK の全 68 CGI を調査済み。以下 10 種は危険・無意味のため移植しない:
+
+| CGI | 理由 |
+|---|---|
+| `fwup_*` (7 種) | ファームウェア更新。失敗=文鎮化。純正に任せる |
+| `send_agpsassistdata`, `update_agpsassistdata` | A-GPS 書き込み。効果不明・副作用あり |
+| `clear_cameralogdata` | カメラ内ログ消去。消す理由がない |
+
+読み取り系 (`get_*`, `check_*`) と撮影・転送・設定系は全移植済み。
+`exec_reboot` / `exec_pwoff` / `clear_resvflg` は確認 UI 付きで実装。

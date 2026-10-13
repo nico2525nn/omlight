@@ -1213,22 +1213,29 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                     TextButton(onClick = vm::toggleSlot) { Text("切替") }
                 }
             }
-            var confirmPower by remember { mutableStateOf(false) }
-            if (confirmPower) {
+            var confirmPower by remember { mutableStateOf<String?>(null) }
+            if (confirmPower != null) {
+                val isReboot = confirmPower == "reboot"
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("カメラの電源を切りますか?", Modifier.weight(1f))
+                    Text(
+                        if (isReboot) "カメラを再起動しますか?" else "カメラの電源を切りますか?",
+                        Modifier.weight(1f),
+                    )
                     TextButton(onClick = {
-                        confirmPower = false
-                        vm.powerOff()
+                        confirmPower = null
+                        if (isReboot) vm.reboot() else vm.powerOff()
                         onClose()
-                    }) { Text("切る") }
-                    TextButton(onClick = { confirmPower = false }) { Text("やめる") }
+                    }) { Text(if (isReboot) "再起動" else "切る") }
+                    TextButton(onClick = { confirmPower = null }) { Text("やめる") }
                 }
             } else {
                 Row {
-                    TextButton(onClick = { confirmPower = true }) {
+                    TextButton(onClick = { confirmPower = "off" }) {
                         Icon(Icons.Default.PowerSettingsNew, null)
                         Text("カメラの電源を切る")
+                    }
+                    TextButton(onClick = { confirmPower = "reboot" }) {
+                        Text("再起動")
                     }
                     TextButton(onClick = vm::clearHistory) {
                         Text("保存履歴をクリア")

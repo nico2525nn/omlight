@@ -226,6 +226,18 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Remote reboot (with UI disconnect after). Caller confirms first. */
+    fun reboot() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            try {
+                withContext(Dispatchers.IO) { c.reboot() }
+            } catch (_: Exception) { /* AP dies with it */ }
+            statusMsg = "カメラを再起動しました"
+            disconnect()
+        }
+    }
+
     /** Last connection diagnosis, shown on the gate after a failure. */
     var diagText: String? by mutableStateOf(null)
         private set
