@@ -253,6 +253,79 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** MySet backup progress text, null when idle. */
+    var mysetMsg: String? by mutableStateOf(null)
+        private set
+
+    /** Download the body's MySet blob into app storage. Best-effort. */
+    fun mysetBackup() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            mysetMsg = "取得中…"
+            try {
+                val ok = withContext(Dispatchers.IO) {
+                    if (!c.mysetBeginGet("all")) return@withContext false
+                    val size = c.mysetSize()
+                    if (size <= 0 || size > 4 * 1024 * 1024) return@withContext false
+                    val out = java.io.ByteArrayOutputStream(size.toInt().coerceAtMost(4 * 1024 * 1024))
+                    var off = 0L
+                    while (off < size) {
+                        val chunk = c.mysetChunk(off, 65536) ?: return@withContext false
+                        if (chunk.isEmpty()) break
+                        out.write(chunk)
+                        off += chunk.size
+                    }
+                    if (off != size) return@withContext false
+                    val f = java.io.File(
+                        getApplication<Application>().filesDir,
+                        "myset-${c.info.model.ifEmpty { "cam" }}.bin",
+                    )
+                    f.writeBytes(out.toByteArray())
+                    true
+                }
+                mysetMsg = null
+                statusMsg = if (ok) "設定を保存しました" else "このカメラは設定保存に対応していません"
+            } catch (e: Exception) {
+                mysetMsg = null
+                statusMsg = "設定の保存に失敗: ${e.message}"
+            }
+        }
+    }
+
+    /** Restore the previously saved MySet blob. Caller confirms first. */
+    fun mysetRestore() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            mysetMsg = "書き込み中…"
+            try {
+                val ok = withContext(Dispatchers.IO) {
+                    val dir = getApplication<Application>().filesDir
+                    val f = dir.listFiles { f: java.io.File ->
+                        f.name.startsWith("myset-") && f.name.endsWith(".bin")
+                    }?.maxByOrNull { it.lastModified() } ?: return@withContext false
+                    val blob = f.readBytes()
+                    if (blob.isEmpty() || blob.size > 4 * 1024 * 1024) return@withContext false
+                    if (!c.mysetBeginRestore(blob.size.toLong())) return@withContext false
+                    var off = 0
+                    while (off < blob.size) {
+                        val end = minOf(off + 65536, blob.size)
+                        if (!c.mysetSendChunk(off.toLong(), blob.copyOfRange(off, end))) {
+                            return@withContext false
+                        }
+                        off = end
+                    }
+                    c.mysetCommitRestore()
+                }
+                mysetMsg = null
+                statusMsg = if (ok) "設定を復元しました" else "復元に失敗しました"
+                if (ok) loadProps()
+            } catch (e: Exception) {
+                mysetMsg = null
+                statusMsg = "復元に失敗: ${e.message}"
+            }
+        }
+    }
+
     /** Last connection diagnosis, shown on the gate after a failure. */
     var diagText: String? by mutableStateOf(null)
         private set

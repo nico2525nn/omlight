@@ -1258,6 +1258,21 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                         Text("保存履歴をクリア")
                     }
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = vm::mysetBackup) {
+                        Text("設定を保存")
+                    }
+                    TextButton(onClick = vm::mysetRestore) {
+                        Text("設定を復元")
+                    }
+                    vm.mysetMsg?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
             Spacer(Modifier.height(8.dp))
             if (vm.propsLoading) {
