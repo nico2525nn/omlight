@@ -286,12 +286,18 @@ class OpcClient(private val t: OpcTransport) {
         var cgi = PhotoInfo()
         if (info.commands.isEmpty() || info.supports("get_exif")) {
             cgi = try {
-                val body = t.getString("get_exif.cgi", "DIR" to path)
-                // get_exif may return XML info or a bare EXIF blob;
-                // flat-XML parse first, fall back to JPEG-EXIF parse.
-                val flat = OpcParse.xmlFlat(body)
-                if (flat.isNotEmpty()) PhotoInfoParse.fromCgi(flat)
-                else PhotoInfoParse.fromJpeg(body.toByteArray(Charsets.ISO_8859_1))
+                t.get("get_exif.cgi", "DIR" to path).use { r ->
+                    if (!r.isSuccessful) throw java.io.IOException("get_exif ${r.code}")
+                    val bytes = r.body!!.bytes()
+                    // XML info or bare EXIF/JPEG blob: sniff first.
+                    val head = bytes.take(512).toByteArray()
+                    val looksXml = head.toString(Charsets.UTF_8).trimStart().startsWith("<")
+                    if (looksXml) {
+                        PhotoInfoParse.fromCgi(OpcParse.xmlFlat(bytes.toString(Charsets.UTF_8)))
+                    } else {
+                        PhotoInfoParse.fromJpeg(bytes)
+                    }
+                }
             } catch (_: Exception) {
                 PhotoInfo()
             }
@@ -303,10 +309,26 @@ class OpcClient(private val t: OpcTransport) {
                 PhotoInfo()
             }
         }
-        val exif = if (preview != null) {
+        var exif = if (preview != null) {
             PhotoInfoParse.fromJpeg(preview)
         } else {
             PhotoInfo()
+        }
+        // Previews on some bodies (E-M10) strip EXIF: fetch the original's
+        // head (EXIF lives in the first ~64KB) as a last resort.
+        if (exif.rows.size <= 1 && !path.substringAfterLast('.', "").uppercase().let {
+                it == "MOV" || it == "AVI" || it == "MP4"
+            }
+        ) {
+            try {
+                t.getRangeTo(path.trimStart('/'), 0, 65535).use { r ->
+                    if (r.isSuccessful) {
+                        val head = r.body!!.bytes()
+                        val headExif = PhotoInfoParse.fromJpeg(head)
+                        if (headExif.rows.size > exif.rows.size) exif = headExif
+                    }
+                }
+            } catch (_: Exception) { /* keep preview EXIF */ }
         }
         return PhotoInfoParse.merge(cgi, exif)
     }

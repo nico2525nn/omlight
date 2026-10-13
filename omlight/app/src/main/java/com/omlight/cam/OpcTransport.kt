@@ -107,6 +107,23 @@ class OpcTransport(
         return exec(b.get().build())
     }
 
+    /**
+     * Bounded range fetch (bytes=from-to). For metadata peeks like EXIF
+     * heads. Callers must handle 200 (full body: read + close early).
+     */
+    @Throws(IOException::class)
+    fun getRangeTo(path: String, from: Long, to: Long): Response {
+        val url = ("http://$host:$port/$path").toHttpUrl().newBuilder()
+        val req = Request.Builder()
+            .url(url.build())
+            .header("Host", host)
+            .header("User-Agent", ua)
+            .header("Range", "bytes=$from-$to")
+            .get()
+            .build()
+        return exec(req)
+    }
+
     /** Raw POST with XML body. Caller closes the response. */
     @Throws(IOException::class)
     fun post(path: String, xml: String, vararg args: Pair<String, String>): Response {

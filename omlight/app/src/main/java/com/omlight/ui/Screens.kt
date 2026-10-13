@@ -631,17 +631,32 @@ private fun ThumbImage(
     scale: ContentScale = ContentScale.Crop,
 ) {
     var bmp: ImageBitmap? by remember(jpeg) { mutableStateOf(null) }
+    var rot by remember(jpeg) { mutableStateOf(0f) }
     LaunchedEffect(jpeg) {
-        bmp = withContext(Dispatchers.Default) {
+        withContext(Dispatchers.Default) {
             runCatching {
-                BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
-            }.getOrNull()
+                val b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                if (b != null) {
+                    bmp = b.asImageBitmap()
+                    rot = when (androidx.exifinterface.media.ExifInterface(
+                        java.io.ByteArrayInputStream(jpeg)
+                    ).getAttributeInt(
+                        androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                        androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
+                    )) {
+                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                        androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                        else -> 0f
+                    }
+                }
+            }
         }
     }
     if (bmp != null) {
         androidx.compose.foundation.Image(
             bmp!!, desc,
-            modifier,
+            modifier.graphicsLayer { rotationZ = rot },
             contentScale = scale,
         )
     }
@@ -1454,6 +1469,7 @@ private fun ViewerSheet(vm: CamViewModel) {
                         Modifier
                             .fillMaxSize()
                             .graphicsLayer {
+                                rotationZ = vm.viewerRotation
                                 scaleX = scale
                                 scaleY = scale
                                 translationX = offset.x

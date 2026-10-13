@@ -177,6 +177,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Fullscreen viewer path, null when closed. */
     var viewerPath: String? by mutableStateOf(null)
         private set
+    /** EXIF orientation degrees for the viewer (0/90/180/270). */
+    var viewerRotation: Float by mutableStateOf(0f)
+        private set
     /** Writable camera props for the settings sheet. */
     var props: List<CamProp> by mutableStateOf(emptyList())
         private set
@@ -746,6 +749,26 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         // hide the detail so the viewer is truly fullscreen. detailJpeg
         // stays cached for the viewer + instant return.
         detailPath = null
+        // EXIF orientation -> display rotation.
+        viewModelScope.launch(Dispatchers.Default) {
+            viewerRotation = try {
+                val jpeg = detailJpeg ?: return@launch
+                val exif = androidx.exifinterface.media.ExifInterface(
+                    java.io.ByteArrayInputStream(jpeg)
+                )
+                when (exif.getAttributeInt(
+                    androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
+                )) {
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                    androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                    else -> 0f
+                }
+            } catch (_: Exception) {
+                0f
+            }
+        }
     }
 
     fun closeViewer() {
