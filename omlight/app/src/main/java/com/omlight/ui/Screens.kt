@@ -119,6 +119,24 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
     LaunchedEffect(Unit) {
         if (vm.conn == Conn.Idle) vm.connect()
     }
+    // Parked downloads (stop-for-now / link death): surface the resume
+    // banner as soon as the service ends with work left on disk.
+    val dlFinished by DownloadService.state.collectAsState()
+    LaunchedEffect(dlFinished.active, dlFinished.queued) {
+        if (dlFinished.active == null && dlFinished.queued == 0) vm.checkResume()
+    }
+    // Notification permission (Android 13+): requested on first download
+    // so progress survives the app going to the background.
+    if (android.os.Build.VERSION.SDK_INT >= 33) {
+        val notifPerm = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { vm.clearNotifPermFlag() }
+        LaunchedEffect(vm.needNotifPerm) {
+            if (vm.needNotifPerm) {
+                notifPerm.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+    }
 
     LaunchedEffect(vm.statusMsg) {
         vm.statusMsg?.let {
@@ -1047,7 +1065,7 @@ private fun DlBanner(vm: CamViewModel) {
                             active != null -> "保存中: ${active.substringAfterLast('/')}"
                             s.queued > 0 -> "待機中… (${s.queued}件)"
                             else -> "完了"
-                        },
+                        } + (if (active != null && s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else ""),
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f),
                     )
@@ -1057,6 +1075,11 @@ private fun DlBanner(vm: CamViewModel) {
                             else DownloadService.pause(ctx)
                         }) {
                             Text(if (s.paused) "再開" else "停止")
+                        }
+                        TextButton(onClick = {
+                            DownloadService.stopLater(ctx)
+                        }) {
+                            Text("中断")
                         }
                     }
                     if (s.failed.isNotEmpty()) {
@@ -1088,9 +1111,29 @@ private fun DlBanner(vm: CamViewModel) {
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
+                if (s.linkDown && s.queued > 0) {
+                    Spacer(Modifier.height(4.dp))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "残り${s.queued}件は保存されています",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = vm::resumePending) { Text("再接続して再開") }
+                    }
+                }
             }
         }
     }
+}
+
+private fun formatSpeed(bps: Long): String = when {
+    bps < 1024 -> "$bps B/s"
+    bps < 1024 * 1024 -> "${bps / 1024} KB/s"
+    else -> "%.1f MB/s".format(bps / 1024.0 / 1024.0)
 }
 
 /** Link-down strip with a manual retry. */

@@ -48,6 +48,10 @@ data class DlState(
     val active: String? = null,
     val activeBytes: Long = 0L,
     val activeTotal: Long = 0L,
+    /** Rolling throughput of the active file, bytes/sec. 0 when idle. */
+    val speedBps: Long = 0L,
+    /** True when the camera link died mid-queue (parked, not failed). */
+    val linkDown: Boolean = false,
     val done: Int = 0,
     val failed: List<String> = emptyList(),
     val skipped: Int = 0,
@@ -77,12 +81,19 @@ class DownloadService : LifecycleService() {
     private var worker: Job? = null
 
     private var holding = false
+    // Held across the whole drain: without them the CPU naps and Wi-Fi
+    // power-saves in the background, collapsing camera throughput to a
+    // crawl (Wi-Fi power-save alone can halve 802.11n rates).
+    private var wakeLock: android.os.PowerManager.WakeLock? = null
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     override fun onCreate() {
         super.onCreate()
         store = TransferStore(this)
         ensureChannel()
-        startForegroundCompat(progressNotification("準備中…", 0, 0, true))
+        startForegroundCompat(
+            progressNotification("OMLight ダウンロード", "準備中…", 0, 0, true, DlState())
+        )
         // Drop staging temps older than a week (crashed runs that will
         // never resume: camera files rotate, Range offsets go stale).
         lifecycleScope.launch(Dispatchers.IO) {
@@ -106,6 +117,7 @@ class DownloadService : LifecycleService() {
                 val sizes = intent.getLongArrayExtra(EXTRA_SIZES) ?: longArrayOf()
                 val taken = intent.getLongArrayExtra(EXTRA_TAKEN) ?: longArrayOf()
                 lifecycleScope.launch {
+                    _state.update { it.copy(linkDown = false) }
                     val fresh = paths.mapIndexed { i, p ->
                         DlItem(p, sizes.getOrElse(i) { 0L }, taken.getOrElse(i) { 0L })
                     }
@@ -143,6 +155,16 @@ class DownloadService : LifecycleService() {
                 _state.update { it.copy(paused = false) }
                 refresh()
             }
+            ACTION_STOP_LATER -> {
+                // "Stop for now": park the queue + active journal on disk,
+                // end the service, and let the user resume from the banner
+                // after reconnecting. Temps stay for Range resume.
+                _state.update { it.copy(paused = false) }
+                lifecycleScope.launch {
+                    mutex.withLock { cancelCurrent = true }
+                }
+                stopRequest = true
+            }
             ACTION_RETRY_FAILED -> {
                 val paths = intent.getStringArrayExtra(EXTRA_PATHS) ?: emptyArray()
                 val sizes = intent.getLongArrayExtra(EXTRA_SIZES) ?: longArrayOf()
@@ -166,6 +188,8 @@ class DownloadService : LifecycleService() {
     }
 
     @Volatile private var cancelCurrent = false
+    /** Stop-for-now request: park the queue on disk and end the service. */
+    @Volatile private var stopRequest = false
     /** In-memory mirror of the channel for journaling. Guarded by mutex. */
     private val pending = ArrayDeque<DlItem>()
     private lateinit var store: TransferStore
@@ -176,7 +200,16 @@ class DownloadService : LifecycleService() {
         }
     }
 
+    /** Same, synchronous: for park paths where the service stops right after. */
+    private suspend fun persistQueueSync() {
+        withContext(Dispatchers.IO) {
+            mutex.withLock { store.saveQueue(pending.toList()) }
+        }
+    }
+
     private suspend fun drain() {
+        acquireLocks()
+        try {
         // Resume leftovers journaled by a previous (killed) run.
         for (item in store.loadQueue()) {
             if (store.isDone(item.path, item.sizeBytes, item.takenAt)) continue
@@ -188,6 +221,16 @@ class DownloadService : LifecycleService() {
             // Pause gate: wait here (service stays foreground) until resume.
             while (_state.value.paused) {
                 delay(500)
+            }
+            if (stopRequest) {
+                // Parked on disk already (active journal + queue journal);
+                // requeue the head item and end so "resume later" picks up.
+                mutex.withLock { pending.addFirst(item) }
+                persistQueueSync()
+                _state.update { it.copy(active = null, queued = pending.size) }
+                refresh()
+                stopSelf()
+                return
             }
             cancelCurrent = false
             _state.update { it.copy(queued = it.queued - 1) }
@@ -208,7 +251,7 @@ class DownloadService : LifecycleService() {
                 val sha = downloadOne(item)
                 store.markDone(item.path, item.sizeBytes, item.takenAt, sha)
                 store.setActive(null)
-                _state.update { it.copy(done = it.done + 1, active = null) }
+                _state.update { it.copy(done = it.done + 1, active = null, speedBps = 0L) }
             } catch (e: Paused) {
                 // Requeue at head; the pause gate above will hold.
                 // Keep the active journal: pause-then-kill still resumes.
@@ -216,10 +259,43 @@ class DownloadService : LifecycleService() {
                 queue.send(item)
                 _state.update { it.copy(queued = it.queued + 1, active = null) }
                 persistQueue()
+            } catch (e: Cancelled) {
+                // Stop-for-now: requeue the head item, clear the request,
+                // and let the park branch above end the service.
+                mutex.withLock { pending.addFirst(item) }
+                queue.send(item)
+                stopRequest = true
+                persistQueueSync()
             } catch (e: Exception) {
                 // Transport died (AP lost?): drop the client so the
                 // next item re-probes, then fail this item.
                 dropClient()
+                val msg = e.message.orEmpty()
+                val parked = msg.contains("not connected") ||
+                    msg.contains("カメラ応答なし") ||
+                    msg.contains("ネットワーク探索に失敗") ||
+                    msg.contains("カメラが見つかりません") ||
+                    msg.contains("Unable to resolve host") ||
+                    e is java.net.SocketTimeoutException ||
+                    e is java.net.UnknownHostException ||
+                    e is java.net.ConnectException
+                if (parked) {
+                    // Link death, not a file problem: park the head item
+                    // for "resume later" instead of burning it as failed,
+                    // and end the service so the AP can be re-joined.
+                    mutex.withLock { pending.addFirst(item) }
+                    queue.send(item)
+                    _state.update {
+                        it.copy(
+                            queued = pending.size, active = null, linkDown = true,
+                            lastError = "カメラのWi-Fiが切れました。再接続して「続きから再開」できます",
+                        )
+                    }
+                    persistQueueSync()
+                    refresh()
+                    stopSelf()
+                    return
+                }
                 store.setActive(null)
                 _state.update {
                     it.copy(
@@ -236,6 +312,37 @@ class DownloadService : LifecycleService() {
                 stopSelf()
             }
         }
+        } finally {
+            releaseLocks()
+        }
+    }
+
+    private fun acquireLocks() {
+        runCatching {
+            val pm = getSystemService(android.os.PowerManager::class.java)
+            wakeLock = pm.newWakeLock(
+                android.os.PowerManager.PARTIAL_WAKE_LOCK, "omlight:dl"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(30 * 60 * 1000L) // failsafe: 30 min max
+            }
+        }
+        runCatching {
+            val wm = applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+            wifiLock = wm.createWifiLock(
+                android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "omlight:dl"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
+    private fun releaseLocks() {
+        runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+        wakeLock = null
+        runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+        wifiLock = null
     }
 
     private suspend fun ensureClient() {
@@ -325,6 +432,10 @@ class DownloadService : LifecycleService() {
                         val src = r.body!!.byteStream()
                         val buf = ByteArray(64 * 1024)
                         var lastPush = 0L
+                        // Rolling speed: bytes since the last UI push over
+                        // wall time. Smoothed by the 500ms push window.
+                        var speedMark = 0L
+                        var speedAt = System.currentTimeMillis()
                         // Verify magic on the first bytes of a fresh file.
                         var headChecked = done > 0
                         val headBuf = java.io.ByteArrayOutputStream(64)
@@ -353,9 +464,13 @@ class DownloadService : LifecycleService() {
                             out.write(buf, 0, n)
                             done += n
                             val now = System.currentTimeMillis()
-                            if (now - lastPush > 250) {
+                            if (now - lastPush > 500) {
                                 lastPush = now
-                                _state.update { it.copy(activeBytes = done) }
+                                val dt = (now - speedAt).coerceAtLeast(1)
+                                val bps = (done - speedMark) * 1000 / dt
+                                speedMark = done
+                                speedAt = now
+                                _state.update { it.copy(activeBytes = done, speedBps = bps) }
                                 refresh()
                             }
                         }
@@ -565,38 +680,78 @@ class DownloadService : LifecycleService() {
 
     private fun refresh() {
         val s = _state.value
+        val total = s.queued + s.done + s.failed.size + (if (s.active != null) 1 else 0)
+        val title = when {
+            total > 0 && s.active != null ->
+                "OMLight 保存中 (${s.done + 1}/$total)"
+            total > 0 && s.queued > 0 && s.paused ->
+                "OMLight 一時停止中 (${s.done}/$total)"
+            total > 0 && s.queued == 0 && s.active == null ->
+                "OMLight 完了 (${s.done}/$total)"
+            else -> "OMLight ダウンロード"
+        }
         val text = when {
+            s.paused && s.active == null -> "停止中 — 再開できます"
             s.active != null && s.activeTotal > 0 ->
                 "${s.active.substringAfterLast('/')} " +
-                    "${s.activeBytes / 1024} / ${s.activeTotal / 1024} KB"
+                    "${s.activeBytes / 1024} / ${s.activeTotal / 1024} KB" +
+                    (if (s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else "")
             s.active != null -> s.active.substringAfterLast('/')
+            s.queued > 0 -> "待機中… (${s.queued}件)"
             else -> "待機中…"
         }
         val max = s.activeTotal.toInt().coerceAtLeast(0)
         val cur = s.activeBytes.toInt().coerceAtMost(max)
         val nm = getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIF_ID, progressNotification(text, max, cur, s.activeTotal <= 0))
+        nm.notify(NOTIF_ID, progressNotification(title, text, max, cur, s.activeTotal <= 0, s))
     }
 
     private fun progressNotification(
+        title: String,
         text: String,
         max: Int,
         progress: Int,
         indeterminate: Boolean,
+        s: DlState,
     ): Notification {
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(this, CHANNEL)
+        val b = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_download)
-            .setContentTitle("OMLight ダウンロード")
+            .setContentTitle(title)
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setProgress(max, progress, indeterminate)
-            .build()
+        // Pause/resume/stop must work from the shade: the phone is often
+        // in a pocket mid-transfer.
+        val busy = s.active != null || s.queued > 0
+        if (busy && s.paused) {
+            b.addAction(0, "再開", svcIntent(11, ACTION_RESUME))
+        } else if (busy) {
+            b.addAction(0, "停止", svcIntent(12, ACTION_PAUSE))
+        }
+        if (busy) {
+            b.addAction(0, "中断", svcIntent(13, ACTION_STOP_LATER))
+        }
+        return b.build()
+    }
+
+    private fun svcIntent(req: Int, action: String): PendingIntent {
+        val i = Intent(this, DownloadService::class.java).apply { this.action = action }
+        return PendingIntent.getService(
+            this, req, i,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    private fun formatSpeed(bps: Long): String = when {
+        bps < 1024 -> "$bps B/s"
+        bps < 1024 * 1024 -> "${bps / 1024} KB/s"
+        else -> "%.1f MB/s".format(bps / 1024.0 / 1024.0)
     }
 
     private fun startForegroundCompat(n: Notification) {
@@ -613,6 +768,7 @@ class DownloadService : LifecycleService() {
     override fun onDestroy() {
         worker?.cancel()
         queue.close()
+        releaseLocks()
         if (holding) {
             holding = false
             // Synchronous release on a daemon thread: lifecycleScope is
@@ -637,6 +793,7 @@ class DownloadService : LifecycleService() {
         const val ACTION_CANCEL = "com.omlight.dl.CANCEL"
         const val ACTION_PAUSE = "com.omlight.dl.PAUSE"
         const val ACTION_RESUME = "com.omlight.dl.RESUME"
+        const val ACTION_STOP_LATER = "com.omlight.dl.STOP_LATER"
         const val ACTION_RETRY_FAILED = "com.omlight.dl.RETRY_FAILED"
         const val EXTRA_PATHS = "paths"
         const val EXTRA_SIZES = "sizes"
@@ -668,6 +825,13 @@ class DownloadService : LifecycleService() {
         fun resume(ctx: Context) {
             ctx.startService(Intent(ctx, DownloadService::class.java).apply {
                 action = ACTION_RESUME
+            })
+        }
+
+        /** Park the queue on disk and stop; resume via the banner later. */
+        fun stopLater(ctx: Context) {
+            ctx.startService(Intent(ctx, DownloadService::class.java).apply {
+                action = ACTION_STOP_LATER
             })
         }
 

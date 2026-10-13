@@ -14,6 +14,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Partial wake lock + high-perf wifi lock during transfers: without
+         them the CPU sleeps and Wi-Fi power-saves in the background,
+         collapsing camera throughput. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Wi-Fi scan / SSID visibility for camera discovery (Android 8+ needs location). -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="32" />

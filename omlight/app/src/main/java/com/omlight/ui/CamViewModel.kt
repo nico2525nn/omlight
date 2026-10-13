@@ -360,9 +360,20 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Resume interrupted downloads now. */
+    /** Resume interrupted downloads now. Connects first if needed. */
     fun resumePending() {
         pendingResume = null
+        if (conn !is Conn.Ready) {
+            resumeAfterConnect = true
+            connect()
+            return
+        }
+        enqueuePending()
+    }
+
+    private var resumeAfterConnect = false
+
+    private fun enqueuePending() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val items = com.omlight.dl.TransferStore(getApplication()).loadQueue()
@@ -482,6 +493,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         if (conn == Conn.Searching) return
         preflight()?.let {
             conn = Conn.Failed(it)
+            resumeAfterConnect = false
             return
         }
         viewModelScope.launch {
@@ -513,6 +525,11 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 startEventStream(c)
                 refresh()
                 checkResume()
+                if (resumeAfterConnect) {
+                    resumeAfterConnect = false
+                    statusMsg = "再接続しました。保存を再開します"
+                    enqueuePending()
+                }
             } catch (e: Exception) {
                 if (holding) {
                     withContext(Dispatchers.IO) { CamSession.release() }
@@ -800,10 +817,25 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     fun thumbFor(path: String): Thumb? = thumbs[path]
 
+    /** Set when a download starts without notification permission (UI requests it). */
+    var needNotifPerm: Boolean by mutableStateOf(false)
+        private set
+
+    fun clearNotifPermFlag() {
+        needNotifPerm = false
+    }
+
     fun download(paths: List<String>) {
         val items = entries.filter { it.path in paths }
             .map { DlItem(it.path, it.sizeBytes, it.takenAtMillis) }
         if (items.isEmpty()) return
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                getApplication(), android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            needNotifPerm = true
+        }
         DownloadService.enqueue(getApplication(), items)
         statusMsg = "${items.size}件をダウンロード開始（バックグラウンドで継続）"
     }

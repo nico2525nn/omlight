@@ -196,22 +196,31 @@ class CameraNetwork(private val ctx: Context) : Closeable {
     /**
      * Watch the bound camera network; [onLost] fires once when it drops.
      * No-op when unbound (emulator fallback) — nothing to watch.
+     * Multiple watchers allowed (UI + DownloadService share one network);
+     * all fire exactly once on loss, then all unregister.
      */
     fun watchLoss(onLost: () -> Unit) {
         val n = network ?: return
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onLost(net: Network) {
-                if (net.networkHandle == n.networkHandle) {
-                    runCatching { cm.unregisterNetworkCallback(this) }
-                    onLost()
-                }
+                if (net.networkHandle == n.networkHandle) fireLoss()
             }
         }
-        lossCallback = cb
+        synchronized(lossWatchers) { lossWatchers.add(cb to onLost) }
         val req = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
         runCatching { cm.registerNetworkCallback(req, cb) }
+    }
+
+    private fun fireLoss() {
+        val fns: List<() -> Unit>
+        synchronized(lossWatchers) {
+            fns = lossWatchers.map { it.second }
+            lossWatchers.forEach { runCatching { cm.unregisterNetworkCallback(it.first) } }
+            lossWatchers.clear()
+        }
+        fns.forEach { runCatching { it() } }
     }
 
     /** True when a VPN is active — it may hijack camera routes. Warn the user. */
@@ -222,13 +231,16 @@ class CameraNetwork(private val ctx: Context) : Closeable {
         }
     }
 
-    private var lossCallback: ConnectivityManager.NetworkCallback? = null
+    private val lossWatchers =
+        ArrayList<Pair<ConnectivityManager.NetworkCallback, () -> Unit>>()
 
     override fun close() {
         callback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         callback = null
-        lossCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
-        lossCallback = null
+        synchronized(lossWatchers) {
+            lossWatchers.forEach { runCatching { cm.unregisterNetworkCallback(it.first) } }
+            lossWatchers.clear()
+        }
         network = null
     }
 }

@@ -234,14 +234,22 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code: int, ctype: str, body: bytes, extra: dict | None = None):
+    def _send(self, code: int, ctype: str, body: bytes, extra: dict | None = None,
+              slow: bool = False):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(body)
+        if slow and ARGS.slow > 0:
+            import time
+            for i in range(0, len(body), 16384):
+                self.wfile.write(body[i:i + 16384])
+                self.wfile.flush()
+                time.sleep(ARGS.slow / 1000.0)
+        else:
+            self.wfile.write(body)
 
     def _xml(self, inner: str):
         self._send(200, "text/xml", (XML % inner).encode())
@@ -478,7 +486,7 @@ class H(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(part)
                 return
-            self._send(200, ctype, data)
+            self._send(200, ctype, data, slow=True)
         else:
             self._send(404, "text/plain", b"unknown: " + p.encode())
 
@@ -566,6 +574,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--shots", default="")
     ap.add_argument("--seed", type=int, default=12)
+    # Slow originals (ms per 16KB chunk): exercises progress UI +
+    # interrupt/resume paths that finish instantly at full speed.
+    ap.add_argument("--slow", type=int, default=0)
     ARGS = ap.parse_args()
     seed_roll(ARGS.seed)
     srv = ThreadingHTTPServer((HOST, ARGS.port), H)
