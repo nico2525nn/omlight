@@ -712,6 +712,14 @@ private fun PhotoCell(
                     CircularProgressIndicator(Modifier.size(24.dp))
                 }
             }
+            // Saved veil: dim the whole cell like stock (downloaded =
+            // quieter). Sits under the badges, above the image.
+            if (saved && !selected) {
+                Box(
+                    Modifier.fillMaxSize()
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.38f))
+                )
+            }
             if (entry.isMovie) {
                 Icon(
                     Icons.Default.Movie, "動画",
@@ -746,7 +754,7 @@ private fun PhotoCell(
                     contentAlignment = Alignment.Center,
                 ) {
                     Icon(
-                        Icons.Default.Check, "保存済み",
+                        Icons.Default.CloudDownload, "保存済み",
                         Modifier.size(14.dp),
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
@@ -1016,6 +1024,11 @@ private fun ZoomHoldButton(label: String, dir: OpcClient.ZoomDir, vm: CamViewMod
 @Composable
 private fun DlBanner(vm: CamViewModel) {
     val s by DownloadService.state.collectAsState()
+    // Downloads finished outside refresh(): re-check MediaStore so saved
+    // veils/badges appear without a manual pull-to-refresh.
+    LaunchedEffect(s.done, s.failed.size) {
+        if (s.done > 0 || s.failed.isNotEmpty()) vm.reconcileSaved()
+    }
     val active = s.active
     if (active == null && s.queued == 0 && s.failed.isEmpty() && s.done == 0) return
     val ctx = androidx.compose.ui.platform.LocalContext.current
