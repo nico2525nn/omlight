@@ -1288,9 +1288,9 @@ private fun SelectRing(state: Int, desc: String, overImage: Boolean = false) {
 }
 
 /**
- * RGB + luminance histogram. Filled channels, white luminance line,
- * quarter grid, clipping readout. Fixed height so the detail sheet
- * doesn't jump while it computes.
+ * RGB + luminance histogram as line graphs. One polyline per channel
+ * (no fills), white luminance on top, quarter grid, clipping readout.
+ * Fixed height so the detail sheet doesn't jump while it computes.
  */
 @Composable
 private fun HistogramGraph(hist: Histogram.Rgb, modifier: Modifier = Modifier) {
@@ -1308,9 +1308,9 @@ private fun HistogramGraph(hist: Histogram.Rgb, modifier: Modifier = Modifier) {
             val bw = size.width / n
             // Log-ish scale: raw peaks bury the midtones. sqrt keeps
             // spikes visible without flattening everything else.
-            fun h(v: Int, peak: Float): Float {
-                if (v <= 0) return 0f
-                return size.height * kotlin.math.sqrt(v / peak)
+            fun yOf(v: Int, peak: Float): Float {
+                if (v <= 0) return size.height
+                return size.height - size.height * kotlin.math.sqrt(v / peak)
             }
             val peak = hist.max.toFloat()
             // Quarter grid.
@@ -1322,34 +1322,22 @@ private fun HistogramGraph(hist: Histogram.Rgb, modifier: Modifier = Modifier) {
             }
             drawLine(grid, androidx.compose.ui.geometry.Offset(0f, size.height - 1),
                 androidx.compose.ui.geometry.Offset(size.width, size.height - 1), 1f)
-            fun area(data: IntArray, color: androidx.compose.ui.graphics.Color) {
+            fun line(data: IntArray, color: androidx.compose.ui.graphics.Color, width: Float) {
                 val path = androidx.compose.ui.graphics.Path()
-                path.moveTo(0f, size.height)
                 for (i in 0 until n) {
-                    val y = size.height - h(data[i], peak)
-                    path.lineTo(i * bw, y)
-                    path.lineTo((i + 1) * bw, y)
+                    val x = i * bw + bw / 2
+                    val y = yOf(data[i], peak)
+                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
                 }
-                path.lineTo(size.width, size.height)
-                path.close()
-                drawPath(path, color.copy(alpha = 0.42f))
+                drawPath(
+                    path, color,
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = width),
+                )
             }
-            // B, G, R fills, then luminance outline on top.
-            area(hist.b, androidx.compose.ui.graphics.Color(0xFF3B82F6))
-            area(hist.g, androidx.compose.ui.graphics.Color(0xFF22C55E))
-            area(hist.r, androidx.compose.ui.graphics.Color(0xFFEF4444))
-            val lp = androidx.compose.ui.graphics.Path()
-            lp.moveTo(0f, size.height)
-            for (i in 0 until n) {
-                val y = size.height - h(hist.y[i], peak)
-                if (i == 0) lp.moveTo(0f, y) else lp.lineTo(i * bw, y)
-                lp.lineTo((i + 1) * bw, y)
-            }
-            drawPath(
-                lp,
-                androidx.compose.ui.graphics.Color.White.copy(alpha = 0.85f),
-                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5f),
-            )
+            line(hist.b, androidx.compose.ui.graphics.Color(0xFF3B82F6), 1.5f)
+            line(hist.g, androidx.compose.ui.graphics.Color(0xFF22C55E), 1.5f)
+            line(hist.r, androidx.compose.ui.graphics.Color(0xFFEF4444), 1.5f)
+            line(hist.y, androidx.compose.ui.graphics.Color.White.copy(alpha = 0.9f), 2f)
         }
         // Clipping readout.
         val clips = buildList {
