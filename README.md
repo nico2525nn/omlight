@@ -33,4 +33,16 @@ cd omlight
 python3 mockcam.py --port 8080       # モックカメラ (エミュレータ用)
 ```
 
+## カメラ調査 (Termux OK)
+
+```sh
+python3 camprobe.py                  # 読み取り専用の全取得
+python3 camprobe.py --shoot          # テスト撮影あり
+python3 camprobe.py --live 30        # ライブビュー30枚
+python3 camprobe.py --deep           # カメラ設定も取得
+```
+
+カメラの Wi-Fi につないで実行。結果は `camprobe-日時/` に保存。
+stdlib のみ、pip 不要。
+
 詳細は [`OMLight_OPC_Protocol_Guide_JA.md`](OMLight_OPC_Protocol_Guide_JA.md)。

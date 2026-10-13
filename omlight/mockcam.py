@@ -437,24 +437,27 @@ class H(BaseHTTPRequestHandler):
                 return
             data = r["bytes"]
             ctype = "application/octet-stream" if r["name"].endswith(".ORF") else "image/jpeg"
-            # HTTP Range (resume): "bytes=N-".
+            # HTTP Range (resume): "bytes=N-" or "bytes=N-M".
             rng = self.headers.get("Range", "")
             if rng.startswith("bytes="):
                 try:
-                    start = int(rng[6:].split("-")[0])
+                    lo, _, hi = rng[6:].partition("-")
+                    start = int(lo)
+                    end = int(hi) if hi.strip() else len(data) - 1
                 except ValueError:
-                    start = 0
+                    start, end = 0, len(data) - 1
                 if start >= len(data):
                     self.send_response(416)
                     self.send_header("Content-Range", f"bytes */{len(data)}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                part = data[start:]
+                end = min(end, len(data) - 1)
+                part = data[start:end + 1]
                 self.send_response(206)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Range",
-                                 f"bytes {start}-{len(data)-1}/{len(data)}")
+                                 f"bytes {start}-{end}/{len(data)}")
                 self.send_header("Content-Length", str(len(part)))
                 self.end_headers()
                 self.wfile.write(part)
