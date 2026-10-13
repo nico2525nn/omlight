@@ -171,6 +171,12 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Shooting/color info rows for the detail sheet. */
     var detailInfo: com.omlight.cam.PhotoInfo by mutableStateOf(com.omlight.cam.PhotoInfo())
         private set
+    /** RGB histogram for the detail sheet, null until computed. */
+    var detailHist: Histogram.Rgb? by mutableStateOf(null)
+        private set
+    /** Fullscreen viewer path, null when closed. */
+    var viewerPath: String? by mutableStateOf(null)
+        private set
     /** Writable camera props for the settings sheet. */
     var props: List<CamProp> by mutableStateOf(emptyList())
         private set
@@ -703,6 +709,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         detailJpeg = null
         detailMovieLen = null
         detailInfo = com.omlight.cam.PhotoInfo()
+        detailHist = null
         if (detailLoading) return
         viewModelScope.launch {
             val c = client() ?: return@launch
@@ -710,6 +717,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val jpeg = withContext(Dispatchers.IO) { c.preview(path) }
                 detailJpeg = jpeg
+                // Histogram off the same bytes (cheap, no extra request).
+                launch { detailHist = Histogram.of(jpeg) }
                 if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
                     val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
                     if (sec > 0) detailMovieLen = "%d:%02d".format(sec / 60, sec % 60)
@@ -729,6 +738,18 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     fun closeDetail() {
         detailPath = null
         detailJpeg = null
+    }
+
+    fun openViewer(path: String) {
+        viewerPath = path
+        // ModalBottomSheet lives in its own window above normal content;
+        // hide the detail so the viewer is truly fullscreen. detailJpeg
+        // stays cached for the viewer + instant return.
+        detailPath = null
+    }
+
+    fun closeViewer() {
+        viewerPath = null
     }
 
     fun deleteDetail() {

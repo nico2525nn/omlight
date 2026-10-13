@@ -1,6 +1,7 @@
 package com.omlight.ui
 
 import android.graphics.BitmapFactory
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -8,6 +9,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -90,6 +93,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -186,6 +190,8 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
                     if (showProps) PropsSheet(vm, onClose = { showProps = false })
                 }
             }
+            // Fullscreen viewer above everything (incl. sheets).
+            if (vm.viewerPath != null) ViewerSheet(vm)
             DlBanner(vm)
         }
     }
@@ -1018,7 +1024,8 @@ private fun DetailSheet(vm: CamViewModel) {
             Box(
                 Modifier.fillMaxWidth().aspectRatio(4f / 3f)
                     .clip(MaterialTheme.shapes.medium)
-                    .background(MaterialTheme.colorScheme.surfaceContainer),
+                    .background(MaterialTheme.colorScheme.surfaceContainer)
+                    .clickable { vm.openViewer(path) },
                 contentAlignment = Alignment.Center,
             ) {
                 val jpeg = vm.detailJpeg
@@ -1029,6 +1036,13 @@ private fun DetailSheet(vm: CamViewModel) {
                 }
             }
             Spacer(Modifier.height(12.dp))
+            // RGB histogram under the preview.
+            vm.detailHist?.let { hist ->
+                if (!hist.isEmpty) {
+                    HistogramGraph(hist)
+                    Spacer(Modifier.height(8.dp))
+                }
+            }
             // Shooting + color info, collapsible.
             val info = vm.detailInfo
             if (!info.isEmpty) {
@@ -1271,4 +1285,141 @@ private fun SelectRing(state: Int, desc: String, overImage: Boolean = false) {
             // 0: bare ring, no glyph.
         }
     }
+}
+
+/** RGB histogram graph: 3 translucent filled channels + frame. */
+@Composable
+private fun HistogramGraph(hist: Histogram.Rgb, modifier: Modifier = Modifier) {
+    androidx.compose.foundation.Canvas(
+        modifier
+            .fillMaxWidth()
+            .height(96.dp)
+            .clip(MaterialTheme.shapes.small)
+            .background(MaterialTheme.colorScheme.surfaceContainer)
+            .padding(8.dp),
+    ) {
+        if (hist.isEmpty) return@Canvas
+        val n = Histogram.BINS
+        val bw = size.width / n
+        val peak = hist.max.toFloat()
+        fun draw(data: IntArray, color: androidx.compose.ui.graphics.Color) {
+            val path = androidx.compose.ui.graphics.Path()
+            path.moveTo(0f, size.height)
+            for (i in 0 until n) {
+                val h = size.height * data[i] / peak
+                path.lineTo(i * bw, size.height - h)
+                path.lineTo((i + 1) * bw, size.height - h)
+            }
+            path.lineTo(size.width, size.height)
+            path.close()
+            drawPath(path, color.copy(alpha = 0.55f))
+        }
+        // B first so R stays on top (Photos order).
+        draw(hist.b, androidx.compose.ui.graphics.Color(0xFF4488FF))
+        draw(hist.g, androidx.compose.ui.graphics.Color(0xFF33BB55))
+        draw(hist.r, androidx.compose.ui.graphics.Color(0xFFFF4444))
+    }
+}
+
+/**
+ * Fullscreen pinch-zoom viewer. Fit-by-default (never cropped),
+ * pinch + double-tap to zoom up to 4x, drag to pan with edge clamping,
+ * back/X to close. Reuses the already-fetched detail JPEG: zero extra
+ * requests when opened from the detail sheet.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ViewerSheet(vm: CamViewModel) {
+    val path = vm.viewerPath ?: return
+    val jpeg = vm.detailJpeg
+    var scale by remember(path) { mutableStateOf(1f) }
+    var offset by remember(path) { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    Box(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.92f))
+            .pointerInput(path) {
+                detectTapGestures(
+                    onDoubleTap = {
+                        scale = if (scale > 1.2f) 1f else 2.5f
+                        if (scale == 1f) offset = androidx.compose.ui.geometry.Offset.Zero
+                    },
+                    onTap = { /* single tap: no-op (X closes) */ },
+                )
+            },
+    ) {
+        if (jpeg != null) {
+            var bmp: ImageBitmap? by remember(jpeg) { mutableStateOf(null) }
+            LaunchedEffect(jpeg) {
+                bmp = withContext(Dispatchers.Default) {
+                    runCatching {
+                        // Full-res decode for zoom sharpness.
+                        BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
+                    }.getOrNull()
+                }
+            }
+            if (bmp != null) {
+                androidx.compose.foundation.Image(
+                    bmp!!, path.substringAfterLast('/'),
+                    Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                            translationX = offset.x
+                            translationY = offset.y
+                        }
+                        .pointerInput(path) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                val next = (scale * zoom).coerceIn(1f, 4f)
+                                // Clamp pan so the image never leaves gaps:
+                                // max offset scales with zoom.
+                                val maxX = size.width * (next - 1) / 2
+                                val maxY = size.height * (next - 1) / 2
+                                offset = androidx.compose.ui.geometry.Offset(
+                                    (offset.x + pan.x).coerceIn(-maxX, maxX),
+                                    (offset.y + pan.y).coerceIn(-maxY, maxY),
+                                )
+                                scale = next
+                                if (scale == 1f) offset =
+                                    androidx.compose.ui.geometry.Offset.Zero
+                            }
+                        },
+                    contentScale = ContentScale.Fit,
+                )
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
+            }
+        } else {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("読込中…", color = MaterialTheme.colorScheme.onPrimary)
+            }
+        }
+        // Top bar: filename + close.
+        Row(
+            Modifier.align(Alignment.TopCenter).fillMaxWidth()
+                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.5f))
+                .padding(horizontal = 8.dp, vertical = 12.dp)
+                .statusBarsPadding(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                path.substringAfterLast('/'),
+                color = MaterialTheme.colorScheme.onPrimary,
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = vm::closeViewer) {
+                Icon(Icons.Default.Close, "閉じる", tint = MaterialTheme.colorScheme.onPrimary)
+            }
+        }
+        // Bottom: save shortcut.
+        ExtendedFloatingActionButton(
+            onClick = { vm.download(listOf(path)) },
+            icon = { Icon(Icons.Default.CloudDownload, null) },
+            text = { Text("保存") },
+            modifier = Modifier.align(Alignment.BottomCenter).padding(24.dp),
+        )
+    }
+    BackHandler(onBack = vm::closeViewer)
 }
