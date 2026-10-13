@@ -434,6 +434,18 @@ class H(BaseHTTPRequestHandler):
                            "<value>0.0</value><enum>-1.0 0.0 +1.0</enum></desc>")
             else:
                 self._xml("<value>0.0</value>")
+        elif p == "/set_takemode.cgi":
+            self._send(200, "text/xml", b"")
+        elif p == "/get_movfileinfo.cgi":
+            r = find(get("DIR"))
+            if r is None:
+                self._send(404, "text/plain", b"no such file")
+                return
+            self._xml("<playtime>42</playtime><moviesize>1920x1080</moviesize>")
+        elif p == "/get_playtargetslot.cgi":
+            self._xml("<targetslot>1</targetslot>")
+        elif p == "/set_playtargetslot.cgi":
+            self._send(200, "text/xml", b"")
         elif p.startswith("/DCIM/"):
             r = find(p)
             if r is None:
@@ -534,6 +546,17 @@ COMMANDLIST = """<cgi name="switch_cammode"><http_method type="get">
 </http_method></cgi>
 <cgi name="exec_protect"><http_method type="get">
 <cmd1 name="com"><param1 name="set"/><param1 name="release"/></cmd1>
+</http_method></cgi>
+<cgi name="set_takemode"><http_method type="get">
+<cmd1 name="com"><param1 name="normal"/><param1 name="selftimer"/></cmd1>
+</http_method></cgi>
+<cgi name="get_movfileinfo"><http_method type="get">
+<cmd1 name="DIR"/>
+</http_method></cgi>
+<cgi name="get_playtargetslot"><http_method type="get">
+</http_method></cgi>
+<cgi name="set_playtargetslot"><http_method type="get">
+<cmd1 name="targetslot"/>
 </http_method></cgi>"""
 
 

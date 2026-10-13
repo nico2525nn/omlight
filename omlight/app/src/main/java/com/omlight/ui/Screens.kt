@@ -48,6 +48,7 @@ import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.WifiOff
@@ -419,17 +420,31 @@ private fun PhotosTab(vm: CamViewModel) {
         Column(Modifier.fillMaxSize()) {
             // One-Time restriction banner.
             if (vm.oneTime) {
+                var confirmClear by remember { mutableStateOf(false) }
                 Card(
                     Modifier.fillMaxWidth().padding(horizontal = 8.dp),
                     colors = androidx.compose.material3.CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.secondaryContainer,
                     ),
                 ) {
-                    Text(
-                        "ワンタイム接続: シェア予約された写真のみ表示されます",
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(8.dp),
-                    )
+                    Row(
+                        Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "ワンタイム接続: シェア予約された写真のみ表示されます",
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (confirmClear) {
+                            TextButton(onClick = {
+                                confirmClear = false
+                                vm.clearReservations()
+                            }) { Text("解除する") }
+                        } else {
+                            TextButton(onClick = { confirmClear = true }) { Text("予約解除") }
+                        }
+                    }
                 }
             }
             // Resume-later banner for interrupted downloads.
@@ -870,6 +885,18 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             QuickProp(vm, "isospeedvalue", "ISO")
+            if (vm.selfTimerSupported) {
+                FilledIconButton(
+                    onClick = vm::toggleSelfTimer,
+                    modifier = Modifier.size(48.dp),
+                ) {
+                    Icon(
+                        Icons.Default.Timer, "セルフタイマー",
+                        tint = if (vm.selfTimer) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
             QuickProp(vm, "wbvalue", "WB")
         }
     }
@@ -1174,6 +1201,17 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+            if (vm.playSlot > 0) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "スロット: ${vm.playSlot}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = vm::toggleSlot) { Text("切替") }
+                }
             }
             var confirmPower by remember { mutableStateOf(false) }
             if (confirmPower) {

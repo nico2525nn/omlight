@@ -137,6 +137,11 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var recording: Boolean by mutableStateOf(false)
         private set
+    /** Self-timer armed (best-effort; hidden when unsupported). */
+    var selfTimer: Boolean by mutableStateOf(false)
+        private set
+    var selfTimerSupported: Boolean by mutableStateOf(false)
+        private set
     /** path -> thumbnail for grid cells. Bounded: evicted on refresh. */
     val thumbs = mutableStateMapOf<String, Thumb>()
     private val thumbStore by lazy { ThumbStore(getApplication()) }
@@ -204,6 +209,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Camera card free space text, loaded with props. Null = unknown. */
     var cardFree: String? by mutableStateOf(null)
+        private set
+    /** Active media slot (dual-slot bodies), -1 = unknown/n/a. */
+    var playSlot: Int by mutableStateOf(-1)
         private set
 
     /** Remote power-off (with UI disconnect after). */
@@ -397,6 +405,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 diagText = null
+                probeShootCaps(c)
                 startEventStream(c)
                 refresh()
                 checkResume()
@@ -725,7 +734,14 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 launch { detailHist = Histogram.of(jpeg) }
                 if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
                     val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
-                    if (sec > 0) detailMovieLen = "%d:%02d".format(sec / 60, sec % 60)
+                    val info = withContext(Dispatchers.IO) { c.movieInfo(path) }
+                    val size = info["moviesize"] ?: info["size"]
+                    detailMovieLen = when {
+                        sec > 0 && size != null -> "%d:%02d ・ %s".format(sec / 60, sec % 60, size)
+                        sec > 0 -> "%d:%02d".format(sec / 60, sec % 60)
+                        size != null -> size
+                        else -> null
+                    }
                 }
                 // EXIF parse is CPU-bound; CGI fetch is IO. Both best-effort.
                 detailInfo = withContext(Dispatchers.IO) { c.photoInfo(path, jpeg) }
@@ -983,6 +999,30 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun toggleSelfTimer() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            val want = !selfTimer
+            val ok = withContext(Dispatchers.IO) { c.selfTimer(want) }
+            if (ok) {
+                selfTimer = want
+                selfTimerSupported = true
+            } else if (!selfTimerSupported) {
+                // First attempt failed: hide the button, it isn't there.
+                statusMsg = "このカメラはセルフタイマー操作に対応していません"
+            }
+        }
+    }
+
+    /** Capability probe after connect (best-effort, no UI spam). */
+    private fun probeShootCaps(c: OpcClient) {
+        // set_takemode shows up in command lists that have it; when the
+        // list is missing entirely we show the button once and let the
+        // first toggle decide (toggleSelfTimer hides on failure).
+        selfTimerSupported = c.info.commands.isEmpty() ||
+            c.info.supports("set_takemode")
+    }
+
     fun toggleLive() {
         if (liveRunning) stopLive() else startLive()
     }
@@ -1058,6 +1098,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 props = withContext(Dispatchers.IO) { c.camPropList() }
                 val free = withContext(Dispatchers.IO) { c.freeBytes() }
                 cardFree = if (free >= 0) formatBytes(free) else null
+                playSlot = withContext(Dispatchers.IO) { c.playSlot() }
                 if (props.isEmpty()) statusMsg = "このカメラは設定一覧に対応していません"
                 noteSuccess()
             } catch (e: Exception) {
@@ -1083,6 +1124,32 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Flip dual-slot bodies between slot 1/2, then refresh the grid. */
+    fun toggleSlot() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            val next = if (playSlot == 1) 2 else 1
+            val ok = withContext(Dispatchers.IO) { c.setPlaySlot(next) }
+            if (ok) {
+                playSlot = next
+                statusMsg = "スロット$next に切り替えました"
+                refresh()
+            } else {
+                statusMsg = "スロット切替に失敗しました"
+            }
+        }
+    }
+
+    /** Clear One-Time share reservations (confirmed in UI first). */
+    fun clearReservations() {
+        viewModelScope.launch {
+            val c = client() ?: return@launch
+            val ok = withContext(Dispatchers.IO) { c.clearReservations() }
+            statusMsg = if (ok) "シェア予約を解除しました" else "解除に失敗しました"
+            if (ok) refresh()
+        }
+    }
+
     // -- SSID connect (Android 10+) ------------------------------------------------------------
 
     /**
@@ -1103,6 +1170,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 conn = Conn.Ready(c.info.model.ifEmpty { "OPC camera" })
                 failures = 0
                 linkDown = false
+                probeShootCaps(c)
                 startEventStream(c)
                 refresh()
             } catch (e: Exception) {

@@ -259,8 +259,9 @@ class OpcClient(private val t: OpcTransport) {
     }
 
     /**
-     * Display-size JPEG (<=1920x1440, spec §6 `get_screennail.cgi`).
-     * Falls back to `get_resizeimg.cgi?size=1920` on cameras without it.
+     * Display-size JPEG. Stock order (dex-verified): screennail, then
+     * `get_resizeimg_witherr` (same image, but failures explain why
+     * instead of bare 404s), then plain `get_resizeimg`.
      */
     @Throws(IOException::class)
     fun preview(path: String): ByteArray {
@@ -270,13 +271,29 @@ class OpcClient(private val t: OpcTransport) {
                 t.get("get_screennail.cgi", "DIR" to path).use { r ->
                     if (r.isSuccessful) return r.body!!.bytes()
                 }
-            } catch (_: IOException) { /* fall through to resize */ }
+            } catch (_: IOException) { /* fall through */ }
         }
-        t.get("get_resizeimg.cgi", "DIR" to path, "size" to "1920").use { r ->
-            if (!r.isSuccessful) throw OpcTransport.statusError(r, "preview")
-            return r.body!!.bytes()
+        if (info.supports("get_resizeimg_witherr")) {
+            try {
+                t.get("get_resizeimg_witherr.cgi", "DIR" to path, "size" to "1920").use { r ->
+                    if (r.isSuccessful) return r.body!!.bytes()
+                    // witherr explains the failure; surface it when the
+                    // plain fallback also dies below.
+                    lastResizeErr = runCatching { r.body!!.string() }.getOrNull()
+                }
+            } catch (_: IOException) { /* fall through */ }
+        }
+        try {
+            t.get("get_resizeimg.cgi", "DIR" to path, "size" to "1920").use { r ->
+                if (!r.isSuccessful) throw OpcTransport.statusError(r, "preview")
+                return r.body!!.bytes()
+            }
+        } catch (e: IOException) {
+            throw IOException(lastResizeErr?.let { "preview: $it" } ?: e.message, e)
         }
     }
+
+    @Volatile private var lastResizeErr: String? = null
 
     /**
      * Shooting/color info for one file, merged from camera CGI
@@ -415,6 +432,7 @@ class OpcClient(private val t: OpcTransport) {
             shutterTake()
         } else {
             setMode(Mode.REC)
+            takeReady()
             takeWithFallback(null)
         }
     }
@@ -506,6 +524,43 @@ class OpcClient(private val t: OpcTransport) {
     fun movieRecord(start: Boolean) {
         setMode(Mode.REC)
         checkOk(t.getString("exec_takemotion.cgi", "com" to movieCom(start)), "movie")
+    }
+
+    /**
+     * Self-timer arm/disarm (`set_takemode.cgi?com=selftimer|normal`,
+     * dex-verified). Best-effort boolean: false when the body lacks it.
+     */
+    fun selfTimer(on: Boolean): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("set_takemode")) return false
+        return try {
+            setMode(Mode.REC)
+            t.getString("set_takemode.cgi", "com" to if (on) "selftimer" else "normal")
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Metering/AF wake-up (`takeready`, optional point). Stock fires this
+     * before the shutter press on takemotion bodies. Best-effort.
+     */
+    fun takeReady(x: Int? = null, y: Int? = null): Boolean {
+        if (info.commands.isNotEmpty() &&
+            !info.supportsArg("exec_takemotion", "com", "takeready")
+        ) return false
+        return try {
+            setMode(Mode.REC)
+            if (x != null && y != null) {
+                val point = "%04dx%04d".format(x.coerceIn(0, 9999), y.coerceIn(0, 9999))
+                t.getString("exec_takemotion.cgi", "com" to "takeready", "point" to point)
+            } else {
+                t.getString("exec_takemotion.cgi", "com" to "takeready")
+            }
+            true
+        } catch (_: IOException) {
+            false
+        }
     }
 
     // -- live view ---------------------------------------------------------------
@@ -851,6 +906,63 @@ class OpcClient(private val t: OpcTransport) {
             m.values.firstNotNullOfOrNull { it.toIntOrNull() } ?: -1
         } catch (_: IOException) {
             -1
+        }
+    }
+
+    /**
+     * Movie file info (`get_movfileinfo.cgi?DIR=`): playtime/size as the
+     * body reports them. Empty when unsupported. Best-effort.
+     */
+    fun movieInfo(path: String): Map<String, String> {
+        if (info.commands.isNotEmpty() && !info.supports("get_movfileinfo")) {
+            return emptyMap()
+        }
+        return try {
+            OpcParse.xmlFlat(t.getString("get_movfileinfo.cgi", "DIR" to path))
+                .filterValues { it.isNotBlank() }
+        } catch (_: IOException) {
+            emptyMap()
+        }
+    }
+
+    /**
+     * Active media slot on dual-slot bodies (`get_playtargetslot`).
+     * -1 when unsupported/unknown. Best-effort.
+     */
+    fun playSlot(): Int {
+        if (info.commands.isNotEmpty() && !info.supports("get_playtargetslot")) return -1
+        return try {
+            val m = OpcParse.xmlFlat(t.getString("get_playtargetslot.cgi"))
+            m.values.firstNotNullOfOrNull { it.toIntOrNull() } ?: -1
+        } catch (_: IOException) {
+            -1
+        }
+    }
+
+    /**
+     * Switch the active media slot (`set_playtargetslot.cgi?targetslot=`).
+     * False when unsupported or refused. Best-effort.
+     */
+    fun setPlaySlot(slot: Int): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("set_playtargetslot")) return false
+        return try {
+            val body = t.getString("set_playtargetslot.cgi", "targetslot" to slot.toString())
+            checkOk(body, "slot")
+            true
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /** Clear One-Time share reservations. Destructive: callers confirm first. */
+    fun clearReservations(): Boolean {
+        if (info.commands.isNotEmpty() && !info.supports("clear_resvflg")) return false
+        return try {
+            val body = t.getString("clear_resvflg.cgi")
+            checkOk(body, "clear reservations")
+            true
+        } catch (_: IOException) {
+            false
         }
     }
 
