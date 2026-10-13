@@ -274,6 +274,50 @@ class OpcClient(private val t: OpcTransport) {
         }
     }
 
+    /**
+     * Shooting/color info for one file, merged from camera CGI
+     * (`get_exif` / `get_imageinfo` when advertised) and the preview
+     * JPEG's own EXIF. Never throws: worst case is empty rows.
+     *
+     * @param preview already-fetched preview bytes (avoids re-download).
+     */
+    fun photoInfo(path: String, preview: ByteArray? = null): PhotoInfo {
+        ensureModeQuiet(Mode.PLAY)
+        var cgi = PhotoInfo()
+        if (info.commands.isEmpty() || info.supports("get_exif")) {
+            cgi = try {
+                val body = t.getString("get_exif.cgi", "DIR" to path)
+                // get_exif may return XML info or a bare EXIF blob;
+                // flat-XML parse first, fall back to JPEG-EXIF parse.
+                val flat = OpcParse.xmlFlat(body)
+                if (flat.isNotEmpty()) PhotoInfoParse.fromCgi(flat)
+                else PhotoInfoParse.fromJpeg(body.toByteArray(Charsets.ISO_8859_1))
+            } catch (_: Exception) {
+                PhotoInfo()
+            }
+        }
+        if (cgi.isEmpty && (info.commands.isEmpty() || info.supports("get_imageinfo"))) {
+            cgi = try {
+                PhotoInfoParse.fromCgi(OpcParse.xmlFlat(t.getString("get_imageinfo.cgi", "DIR" to path)))
+            } catch (_: Exception) {
+                PhotoInfo()
+            }
+        }
+        val exif = if (preview != null) {
+            PhotoInfoParse.fromJpeg(preview)
+        } else {
+            PhotoInfo()
+        }
+        return PhotoInfoParse.merge(cgi, exif)
+    }
+
+    /** ensureMode that never throws (info fetch is best-effort). */
+    private fun ensureModeQuiet(want: Mode) {
+        try {
+            ensureMode(want)
+        } catch (_: IOException) { /* best-effort */ }
+    }
+
     /** Original file bytes via plain HTTP GET (spec §7 Get Image). */
     @Throws(IOException::class)
     fun original(path: String): Response = originalFrom(path, 0L)

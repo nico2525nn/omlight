@@ -5,6 +5,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -29,7 +31,10 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.IndeterminateCheckBox
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
@@ -1024,6 +1029,55 @@ private fun DetailSheet(vm: CamViewModel) {
                 }
             }
             Spacer(Modifier.height(12.dp))
+            // Shooting + color info, collapsible.
+            val info = vm.detailInfo
+            if (!info.isEmpty) {
+                var expanded by remember(path) { mutableStateOf(false) }
+                // Headline: exposure trio always visible.
+                val head = info.rows.filter {
+                    it.first in setOf("絞り", "シャッター", "ISO", "露出補正")
+                }.take(4).joinToString(" ・ ") { it.second }
+                Row(
+                    Modifier.fillMaxWidth()
+                        .clip(MaterialTheme.shapes.small)
+                        .clickable { expanded = !expanded }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.Info, null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        head.ifEmpty { "撮影情報" },
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        if (expanded) "閉じる" else "開く",
+                    )
+                }
+                if (expanded) {
+                    Column(Modifier.padding(start = 32.dp)) {
+                        info.rows.forEach { (k, v) ->
+                            Row(
+                                Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            ) {
+                                Text(
+                                    k,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.width(130.dp),
+                                )
+                                Text(v, style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
             if (confirmDelete) {
                 Text("カメラから削除しますか? この操作は取り消せません。")
                 Spacer(Modifier.height(8.dp))

@@ -47,11 +47,37 @@ ARGS: argparse.Namespace
 ROLL: list[dict] = []  # {name, dir, bytes, thumb, screen, w, h}
 
 
-def make_jpeg(w: int, h: int, label: str, hue: int) -> bytes:
+def make_jpeg(w: int, h: int, label: str, hue: int, exif: bool = False) -> bytes:
     img = Image.new("RGB", (w, h), (hue % 256, (hue * 2) % 256, (hue * 3) % 256))
     d = ImageDraw.Draw(img)
     d.text((w // 4, h // 2 - 10), label, fill=(255, 255, 255))
     buf = io.BytesIO()
+    if exif:
+        try:
+            import piexif
+            zeroth = {
+                piexif.ImageIFD.Make: "OLYMPUS IMAGING CORP.",
+                piexif.ImageIFD.Model: "E-Mock1",
+                piexif.ImageIFD.Software: "OMLightMock",
+            }
+            exif_ifd = {
+                piexif.ExifIFD.DateTimeOriginal: "2026:10:12 12:00:00",
+                piexif.ExifIFD.FNumber: (28, 10),
+                piexif.ExifIFD.ExposureTime: (1, 250),
+                piexif.ExifIFD.ISOSpeedRatings: 200,
+                piexif.ExifIFD.ExposureBiasValue: (0, 3),
+                piexif.ExifIFD.FocalLength: (2500, 100),
+                piexif.ExifIFD.WhiteBalance: 0,
+                piexif.ExifIFD.Flash: 16,
+                piexif.ExifIFD.MeteringMode: 5,
+                piexif.ExifIFD.ExposureProgram: 3,
+                piexif.ExifIFD.ColorSpace: 1,
+            }
+            img.save(buf, "JPEG", quality=85,
+                     exif=piexif.dump({"0th": zeroth, "Exif": exif_ifd}))
+            return buf.getvalue()
+        except ImportError:
+            pass
     img.save(buf, "JPEG", quality=85)
     return buf.getvalue()
 
@@ -65,12 +91,12 @@ def add_photo(tag: str, folder: str = "/DCIM/100OLYMP", raw: bool = False) -> di
         # but byte-identical in the magic the app verifies).
         full = b"IIRO" + bytes(44000)
     else:
-        full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37)
+        full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37, exif=True)
     ROLL.append({
         "name": name, "dir": folder,
         "bytes": full,
         "thumb": make_jpeg(160, 120, name, 40 + n * 37),
-        "screen": make_jpeg(640, 480, name, 40 + n * 37),
+        "screen": make_jpeg(640, 480, name, 40 + n * 37, exif=True),
     })
     return ROLL[-1]
 
@@ -293,6 +319,20 @@ class H(BaseHTTPRequestHandler):
                 self._send(404, "text/plain", b"no such file")
                 return
             self._send(200, "image/jpeg", r["screen"])
+        elif p == "/get_exif.cgi":
+            r = find(get("DIR"))
+            if r is None:
+                self._send(404, "text/plain", b"no such file")
+                return
+            # Camera color/shooting info as flat XML (E-M5 II shape TBD;
+            # merged with preview EXIF on the app side).
+            self._xml("<shutspeedvalue>250</shutspeedvalue>"
+                      "<focalvalue>2.8</focalvalue>"
+                      "<expcomp>0.0</expcomp>"
+                      "<isospeedvalue>200</isospeedvalue>"
+                      "<wbvalue>auto</wbvalue>"
+                      "<colortone>natural</colortone>"
+                      "<takemode>A</takemode>")
         elif p == "/exec_takemotion.cgi":
             com = get("com")
             if com in ("starttake", "newstarttake"):
@@ -451,6 +491,9 @@ COMMANDLIST = """<cgi name="switch_cammode"><http_method type="get">
 <cmd1 name="mode"><param1 name="rec"><cmd2 name="lvqty"><param2 name="0320x0240"/><param2 name="0640x0480"/><param2 name="0800x0600"/><param2 name="1024x0768"/><param2 name="1280x0960"/></cmd2></param1><param1 name="play"/><param1 name="shutter"/></cmd1>
 </http_method></cgi>
 <cgi name="get_imglist"><http_method type="get">
+<cmd1 name="DIR"/>
+</http_method></cgi>
+<cgi name="get_exif"><http_method type="get">
 <cmd1 name="DIR"/>
 </http_method></cgi>
 <cgi name="get_thumbnail"><http_method type="get">

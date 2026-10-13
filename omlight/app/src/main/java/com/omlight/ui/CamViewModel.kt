@@ -168,6 +168,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Movie length text for the detail sheet, null when n/a. */
     var detailMovieLen: String? by mutableStateOf(null)
         private set
+    /** Shooting/color info rows for the detail sheet. */
+    var detailInfo: com.omlight.cam.PhotoInfo by mutableStateOf(com.omlight.cam.PhotoInfo())
+        private set
     /** Writable camera props for the settings sheet. */
     var props: List<CamProp> by mutableStateOf(emptyList())
         private set
@@ -699,16 +702,20 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         detailPath = path
         detailJpeg = null
         detailMovieLen = null
+        detailInfo = com.omlight.cam.PhotoInfo()
         if (detailLoading) return
         viewModelScope.launch {
             val c = client() ?: return@launch
             detailLoading = true
             try {
-                detailJpeg = withContext(Dispatchers.IO) { c.preview(path) }
+                val jpeg = withContext(Dispatchers.IO) { c.preview(path) }
+                detailJpeg = jpeg
                 if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
                     val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
                     if (sec > 0) detailMovieLen = "%d:%02d".format(sec / 60, sec % 60)
                 }
+                // EXIF parse is CPU-bound; CGI fetch is IO. Both best-effort.
+                detailInfo = withContext(Dispatchers.IO) { c.photoInfo(path, jpeg) }
                 noteSuccess()
             } catch (e: Exception) {
                 statusMsg = "プレビューの取得に失敗: ${e.message}"

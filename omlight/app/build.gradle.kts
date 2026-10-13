@@ -127,6 +127,9 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // EXIF read for the detail sheet (shooting + color info).
+    implementation("androidx.exifinterface:exifinterface:1.3.6")
+
     // QR scan (WIFI: credentials): Play-services Code Scanner.
     // The scan UI + decode live in GMS (OS-side), so the APK barely grows.
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
