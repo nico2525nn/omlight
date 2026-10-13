@@ -304,6 +304,14 @@ class OpcClient(private val t: OpcTransport) {
      */
     fun photoInfo(path: String, preview: ByteArray? = null): PhotoInfo {
         ensureModeQuiet(Mode.PLAY)
+        // Preview EXIF first: zero extra requests, instant when the body
+        // embeds it (E-M5 II). Only bodies that strip preview EXIF
+        // (E-M10) fall through to the CGI + head-fetch path below.
+        var exif = if (preview != null) {
+            PhotoInfoParse.fromJpeg(preview)
+        } else {
+            PhotoInfo()
+        }
         var cgi = PhotoInfo()
         if (info.commands.isEmpty() || info.supports("get_exif")) {
             cgi = try {
@@ -329,11 +337,6 @@ class OpcClient(private val t: OpcTransport) {
             } catch (_: Exception) {
                 PhotoInfo()
             }
-        }
-        var exif = if (preview != null) {
-            PhotoInfoParse.fromJpeg(preview)
-        } else {
-            PhotoInfo()
         }
         // Previews on some bodies (E-M10) strip EXIF: fetch the original's
         // head (EXIF lives in the first ~64KB) as a last resort.

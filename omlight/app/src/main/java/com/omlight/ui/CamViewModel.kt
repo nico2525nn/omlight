@@ -174,6 +174,21 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     /** Movie length text for the detail sheet, null when n/a. */
     var detailMovieLen: String? by mutableStateOf(null)
         private set
+    /**
+     * In-memory detail bundle cache: path -> (jpeg, movieLen, info).
+     * Best-effort LRU so reopening a photo is instant without hammering
+     * the camera. Bounded small: previews are ~100-600KB each.
+     */
+    private val detailCache = object : LinkedHashMap<String, DetailBundle>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, DetailBundle>?): Boolean =
+            size > 12
+    }
+
+    private data class DetailBundle(
+        val jpeg: ByteArray,
+        val movieLen: String?,
+        val info: com.omlight.cam.PhotoInfo,
+    )
     /** Shooting/color info rows for the detail sheet. */
     var detailInfo: com.omlight.cam.PhotoInfo by mutableStateOf(com.omlight.cam.PhotoInfo())
         private set
@@ -729,24 +744,43 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
 
     // -- detail -------------------------------------------------------------------------
 
+    private var detailJob: Job? = null
+
     fun openDetail(path: String) {
+        // Cache hit: show instantly, no camera traffic at all.
+        synchronized(detailCache) { detailCache[path] }?.let { hit ->
+            detailJob?.cancel()
+            detailJob = null
+            detailPath = path
+            detailJpeg = hit.jpeg
+            detailMovieLen = hit.movieLen
+            detailInfo = hit.info
+            detailHist = null
+            viewModelScope.launch { detailHist = Histogram.of(hit.jpeg) }
+            return
+        }
+        // New load: cancel any in-flight one so a slow photo A can never
+        // overwrite photo B's sheet (the old detailLoading flag dropped
+        // the new request instead, forcing a third tap).
+        detailJob?.cancel()
         detailPath = path
         detailJpeg = null
         detailMovieLen = null
         detailInfo = com.omlight.cam.PhotoInfo()
         detailHist = null
-        if (detailLoading) return
-        viewModelScope.launch {
+        detailJob = viewModelScope.launch {
             val c = client() ?: return@launch
             detailLoading = true
             try {
                 val jpeg = withContext(Dispatchers.IO) { c.preview(path) }
+                if (detailPath != path || !isActive) return@launch
                 detailJpeg = jpeg
                 // Histogram off the same bytes (cheap, no extra request).
                 launch { detailHist = Histogram.of(jpeg) }
                 if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
                     val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
                     val info = withContext(Dispatchers.IO) { c.movieInfo(path) }
+                    if (detailPath != path || !isActive) return@launch
                     val size = info["moviesize"] ?: info["size"]
                     detailMovieLen = when {
                         sec > 0 && size != null -> "%d:%02d ・ %s".format(sec / 60, sec % 60, size)
@@ -756,9 +790,15 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 // EXIF parse is CPU-bound; CGI fetch is IO. Both best-effort.
-                detailInfo = withContext(Dispatchers.IO) { c.photoInfo(path, jpeg) }
+                val info = withContext(Dispatchers.IO) { c.photoInfo(path, jpeg) }
+                if (detailPath != path || !isActive) return@launch
+                detailInfo = info
+                synchronized(detailCache) {
+                    detailCache[path] = DetailBundle(jpeg, detailMovieLen, detailInfo)
+                }
                 noteSuccess()
             } catch (e: Exception) {
+                if (!isActive) return@launch
                 statusMsg = "プレビューの取得に失敗: ${e.message}"
                 noteFailure("プレビュー")
             } finally {

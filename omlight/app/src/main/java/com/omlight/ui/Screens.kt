@@ -719,6 +719,23 @@ private fun PhotoCell(
                     tint = MaterialTheme.colorScheme.onPrimary,
                 )
             }
+            // RAW badge: bottom-left pill. Movies show the film icon
+            // instead (never both at once).
+            if (entry.isRaw && !entry.isMovie) {
+                Box(
+                    Modifier.align(Alignment.BottomStart).padding(6.dp)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "RAW",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            }
             // Saved badge: verified in MediaStore.
             if (saved) {
                 Box(
