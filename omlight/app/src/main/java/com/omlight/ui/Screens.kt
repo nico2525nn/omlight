@@ -24,15 +24,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
@@ -525,17 +525,26 @@ private fun PhotosTab(vm: CamViewModel) {
                     }
                 }
             } else {
-                val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+                val listState = rememberLazyListState()
                 // Lookahead: when the user scrolls, prefetch thumbs just
                 // beyond the viewport so cells are warm on arrival.
-                LaunchedEffect(gridState.isScrollInProgress) {
-                    if (!gridState.isScrollInProgress) return@LaunchedEffect
-                    val layout = gridState.layoutInfo
-                    val last = layout.visibleItemsInfo.lastOrNull()?.index ?: return@LaunchedEffect
-                    // Map visible grid indices back to entries (headers
-                    // occupy indices too, so resolve via keys).
+                // Row keys are "row-<day>-<i>"; resolve packed paths via
+                // the shared pack inputs (sections + aspects).
+                val lookaheadAspects = remember(sections, vm.thumbs.size) {
+                    sections.associate { (day, items) ->
+                        day to items.map { it.path to vm.aspectFor(it.path) }
+                    }
+                }
+                LaunchedEffect(listState.isScrollInProgress, lookaheadAspects) {
+                    if (!listState.isScrollInProgress) return@LaunchedEffect
+                    val layout = listState.layoutInfo
                     val keys = layout.visibleItemsInfo.mapNotNull { it.key as? String }
-                    val paths = keys.filter { it.startsWith("/DCIM/") }
+                    // Visible rows -> their packed paths (approx: whole
+                    // visible days' paths, cheap and good enough).
+                    val days = keys.mapNotNull {
+                        if (it.startsWith("row-")) it.removePrefix("row-").substringBeforeLast('-') else null
+                    }.toSet()
+                    val paths = days.flatMap { d -> lookaheadAspects[d].orEmpty().map { it.first } }
                     val tail = paths.takeLast(6)
                     if (tail.isNotEmpty()) vm.prefetchAhead(tail)
                     // Also warm the next section's worth past the viewport.
@@ -545,62 +554,108 @@ private fun PhotosTab(vm: CamViewModel) {
                         vm.prefetchAhead(flat.drop(anchor + 1).take(18))
                     }
                 }
-                LazyVerticalGrid(
-                    GridCells.Adaptive(120.dp),
-                    Modifier.fillMaxSize(),
-                    state = gridState,
-                    contentPadding = PaddingValues(8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                // Justified rows (Flickr-style): cells keep their aspect,
+                // each row stretches to the full width. Row height floats
+                // (~150dp target): landscape rows come out short with few
+                // cells, portrait rows tall with more — no column count.
+                androidx.compose.foundation.layout.BoxWithConstraints(
+                    Modifier.fillMaxSize()
                 ) {
-                    for ((day, items) in sections) {
-                        item(key = "hdr-$day", span = { androidx.compose.foundation.lazy.grid.GridItemSpan(maxLineSpan) }) {
-                            // Day header: label + round check toggle (Photos style).
-                            val allSel = items.all { it.path in selected }
-                            val someSel = !allSel && items.any { it.path in selected }
-                            Row(
-                                Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    vm.dayLabel(day),
-                                    style = MaterialTheme.typography.titleSmall,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                IconButton(onClick = {
-                                    selectDay(day, items.map { it.path })
-                                }) {
-                                    SelectRing(
-                                        state = when {
-                                            allSel -> 2
-                                            someSel -> 1
-                                            else -> 0
-                                        },
-                                        desc = "この日を選択",
-                                    )
+                    val density = androidx.compose.ui.platform.LocalDensity.current
+                    val widthPx = with(density) { maxWidth.toPx() } - with(density) { 16.dp.toPx() }
+                    val targetPx = with(density) { 150.dp.toPx() }
+                    val spacingPx = with(density) { 4.dp.toPx() }
+                    val spacingDp = 4.dp
+                    // Pack per section so rows never mix days. Aspect reads
+                    // make this recompose as thumbs (and aspects) land.
+                    val packed = remember(lookaheadAspects, widthPx) {
+                        lookaheadAspects.flatMap { (day, cells) ->
+                            Justify.pack(
+                                cells.map { Justify.Cell(it.first, it.second) },
+                                widthPx, targetPx, spacing = spacingPx,
+                            ).mapIndexed { i, row -> Triple(day, i, row) }
+                        }
+                    }
+                    val byPath = remember(list) { list.associateBy { it.path } }
+                    LazyColumn(
+                        Modifier.fillMaxSize(),
+                        state = listState,
+                        contentPadding = PaddingValues(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(spacingDp),
+                    ) {
+                        var lastDay: String? = null
+                        for ((day, i, row) in packed) {
+                            if (day != lastDay) {
+                                lastDay = day
+                                val items = sections.first { it.first == day }.second
+                                item(key = "hdr-$day") {
+                                    // Day header: label + round check toggle (Photos style).
+                                    val allSel = items.all { it.path in selected }
+                                    val someSel = !allSel && items.any { it.path in selected }
+                                    Row(
+                                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            vm.dayLabel(day),
+                                            style = MaterialTheme.typography.titleSmall,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        IconButton(onClick = {
+                                            selectDay(day, items.map { it.path })
+                                        }) {
+                                            SelectRing(
+                                                state = when {
+                                                    allSel -> 2
+                                                    someSel -> 1
+                                                    else -> 0
+                                                },
+                                                desc = "この日を選択",
+                                            )
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        items(items, key = { it.path }) { e ->
-                            androidx.compose.runtime.LaunchedEffect(e.path) {
-                                vm.needThumb(e)
+                            item(key = "row-$day-$i") {
+                                Row(
+                                    Modifier.fillMaxWidth().height(with(density) { row.height.toDp() }),
+                                    horizontalArrangement = Arrangement.spacedBy(spacingDp),
+                                ) {
+                                    for (cell in row.cells) {
+                                        val e = byPath[cell.key] ?: continue
+                                        androidx.compose.runtime.LaunchedEffect(e.path) {
+                                            vm.needThumb(e)
+                                        }
+                                        PhotoCell(
+                                            entry = e,
+                                            thumb = vm.thumbFor(e.path),
+                                            selected = e.path in selected,
+                                            selecting = selecting,
+                                            saved = e.path in vm.savedPaths && e.path !in selected,
+                                            dl = dlMarkFor(dlState, e.path),
+                                            onTap = {
+                                                if (selecting) toggle(e.path)
+                                                else vm.openDetail(e.path)
+                                            },
+                                            onLongPress = {
+                                                selecting = true
+                                                selected = selected + e.path
+                                            },
+                                            modifier = Modifier.weight(cell.aspect, fill = true),
+                                        )
+                                    }
+                                    // Unjustified last row: pad the tail so
+                                    // cells keep their packed widths.
+                                    if (!row.justified) {
+                                        val usedW = row.cells.sumOf { it.aspect.toDouble() } * row.height +
+                                            spacingPx * (row.cells.size - 1).coerceAtLeast(0)
+                                        val tailW = widthPx - usedW.toFloat()
+                                        if (tailW > 1f) {
+                                            Spacer(Modifier.width(with(density) { tailW.toDp() }))
+                                        }
+                                    }
+                                }
                             }
-                            PhotoCell(
-                                entry = e,
-                                thumb = vm.thumbFor(e.path),
-                                selected = e.path in selected,
-                                selecting = selecting,
-                                saved = e.path in vm.savedPaths && e.path !in selected,
-                                dl = dlMarkFor(dlState, e.path),
-                                onTap = {
-                                    if (selecting) toggle(e.path)
-                                    else vm.openDetail(e.path)
-                                },
-                                onLongPress = {
-                                    selecting = true
-                                    selected = selected + e.path
-                                },
-                            )
                         }
                     }
                 }
@@ -665,26 +720,36 @@ private fun ThumbImage(
     // Header rotation wins: camera thumbnails carry no EXIF of their
     // own, so per-bind EXIF reads always resolve to 0 here. EXIF
     // fallback stays for direct-JPEG callers (detail previews).
-    var rot by remember(thumb) { mutableStateOf(thumb.degrees.toFloat()) }
     LaunchedEffect(jpeg) {
         withContext(Dispatchers.Default) {
             runCatching {
-                val b = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
-                if (b != null) {
-                    bmp = b.asImageBitmap()
-                    if (thumb.degrees == 0) {
-                        rot = when (androidx.exifinterface.media.ExifInterface(
+                val b0 = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                if (b0 != null) {
+                    var deg = thumb.degrees
+                    if (deg == 0) {
+                        deg = when (androidx.exifinterface.media.ExifInterface(
                             java.io.ByteArrayInputStream(jpeg)
                         ).getAttributeInt(
                             androidx.exifinterface.media.ExifInterface.TAG_ORIENTATION,
                             androidx.exifinterface.media.ExifInterface.ORIENTATION_NORMAL,
                         )) {
-                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                            else -> 0f
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                            androidx.exifinterface.media.ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                            else -> 0
                         }
                     }
+                    // Physical rotation: justified cells size from the
+                    // bitmap bounds, so a graphicsLayer spin would lie
+                    // about the aspect (portrait drawn in a landscape
+                    // box). Detail previews pass Fit and are unaffected.
+                    val m = android.graphics.Matrix()
+                    if (deg != 0) m.postRotate(deg.toFloat())
+                    val b = if (deg != 0) {
+                        android.graphics.Bitmap.createBitmap(b0, 0, 0, b0.width, b0.height, m, true)
+                    } else b0
+                    if (b !== b0) b0.recycle()
+                    bmp = b.asImageBitmap()
                 }
             }
         }
@@ -692,7 +757,7 @@ private fun ThumbImage(
     if (bmp != null) {
         androidx.compose.foundation.Image(
             bmp!!, desc,
-            modifier.graphicsLayer { rotationZ = rot },
+            modifier,
             contentScale = scale,
         )
     }
@@ -709,11 +774,11 @@ private fun PhotoCell(
     dl: Float?,
     onTap: () -> Unit,
     onLongPress: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     Card(
-        Modifier
-            .fillMaxWidth()
-            .aspectRatio(1f)
+        modifier
+            .fillMaxHeight()
             .combinedClickable(onClick = onTap, onLongClick = onLongPress),
     ) {
         Box(Modifier.fillMaxSize()) {

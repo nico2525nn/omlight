@@ -148,6 +148,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     private var intervalJob: Job? = null
     /** path -> thumbnail for grid cells. Bounded: evicted on refresh. */
     val thumbs = mutableStateMapOf<String, Thumb>()
+    /** path -> display aspect (w/h) from thumb bounds + rotation. Same lifecycle as [thumbs]. */
+    private val aspectMap = mutableStateMapOf<String, Float>()
     private val thumbStore by lazy { ThumbStore(getApplication()) }
     /** Latest liveview JPEG, or null when stopped. */
     var liveFrame: ByteArray? by mutableStateOf(null)
@@ -664,6 +666,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         }
         entries = emptyList()
         thumbs.clear()
+        aspectMap.clear()
         props = emptyList()
         closeDetail()
         captureState = null
@@ -699,7 +702,9 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                     "カメラの一覧は空でした。カメラ側で「ワンタイム接続」や" +
                         "「シェア予約のみ表示」になっていないか確認してください。"
                 } else null
-                thumbs.keys.retainAll(list.map { it.path }.toSet())
+                val keep = list.map { it.path }.toSet()
+                thumbs.keys.retainAll(keep)
+                aspectMap.keys.retainAll(keep)
                 prefetchThumbs(list.take(60))
                 noteSuccess()
                 reconcileSaved()
@@ -726,6 +731,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 val cached = thumbStore.get(e.path, e.sizeBytes)
                 if (cached != null) {
                     thumbs[e.path] = cached
+                    storeAspect(e.path, cached)
                 } else {
                     missing.add(e)
                 }
@@ -750,6 +756,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                         val thumb = c.thumbnail(e.path)
                         thumbStore.put(e.path, e.sizeBytes, thumb)
                         thumbs[e.path] = thumb
+                        storeAspect(e.path, thumb)
                     } finally {
                         thumbFetching.remove(e.path)
                     }
@@ -791,6 +798,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         if (!thumbFetching.add(entry.path)) return
         thumbStore.get(entry.path, entry.sizeBytes)?.let {
             thumbs[entry.path] = it
+            storeAspect(entry.path, it)
             thumbFetching.remove(entry.path)
             return
         }
@@ -807,6 +815,7 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 val thumb = c.thumbnail(entry.path)
                 thumbStore.put(entry.path, entry.sizeBytes, thumb)
                 thumbs[entry.path] = thumb
+                storeAspect(entry.path, thumb)
             } catch (_: Exception) { /* retry on next bind */ }
             finally {
                 thumbSem.release()
@@ -816,6 +825,25 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun thumbFor(path: String): Thumb? = thumbs[path]
+
+    /** Display aspect for justified packing. Unknown thumbs assume 4:3 landscape. */
+    fun aspectFor(path: String): Float = aspectMap[path] ?: (4f / 3f)
+
+    /** Decode-once aspect cache: bounds + header rotation, clamped to sane photos. */
+    private fun storeAspect(path: String, thumb: Thumb) {
+        val aspect = try {
+            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(thumb.jpeg, 0, thumb.jpeg.size, opts)
+            val w = opts.outWidth
+            val h = opts.outHeight
+            if (w > 0 && h > 0) {
+                if (thumb.degrees == 90 || thumb.degrees == 270) h.toFloat() / w else w.toFloat() / h
+            } else 4f / 3f
+        } catch (_: Exception) {
+            4f / 3f
+        }
+        aspectMap[path] = aspect.coerceIn(0.25f, 4f)
+    }
 
     /** Set when a download starts without notification permission (UI requests it). */
     var needNotifPerm: Boolean by mutableStateOf(false)
