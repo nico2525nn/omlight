@@ -45,6 +45,8 @@ data class DlItem(
 /** Observable queue state for the UI. */
 data class DlState(
     val queued: Int = 0,
+    /** Camera paths still waiting (mirrors pending; for grid queue marks). */
+    val queuedPaths: Set<String> = emptySet(),
     val active: String? = null,
     val activeBytes: Long = 0L,
     val activeTotal: Long = 0L,
@@ -52,6 +54,8 @@ data class DlState(
     val speedBps: Long = 0L,
     /** True when the camera link died mid-queue (parked, not failed). */
     val linkDown: Boolean = false,
+    /** True when the user parked the queue (stop-for-now, service stopped). */
+    val parked: Boolean = false,
     val done: Int = 0,
     val failed: List<String> = emptyList(),
     val skipped: Int = 0,
@@ -117,24 +121,30 @@ class DownloadService : LifecycleService() {
                 val sizes = intent.getLongArrayExtra(EXTRA_SIZES) ?: longArrayOf()
                 val taken = intent.getLongArrayExtra(EXTRA_TAKEN) ?: longArrayOf()
                 lifecycleScope.launch {
-                    _state.update { it.copy(linkDown = false) }
+                    _state.update { it.copy(linkDown = false, parked = false) }
                     val fresh = paths.mapIndexed { i, p ->
                         DlItem(p, sizes.getOrElse(i) { 0L }, taken.getOrElse(i) { 0L })
                     }
                     // Duplicate skip: already-verified files never re-download.
                     var skipped = 0
+                    mutex.withLock {
+                        for (item in fresh) {
+                            if (store.isDone(item.path, item.sizeBytes, item.takenAt)) {
+                                skipped++
+                            } else {
+                                pending.add(item)
+                            }
+                        }
+                        syncQueueState()
+                    }
                     for (item in fresh) {
-                        if (store.isDone(item.path, item.sizeBytes, item.takenAt)) {
-                            skipped++
-                        } else {
-                            pending.add(item)
+                        if (!store.isDone(item.path, item.sizeBytes, item.takenAt)) {
                             queue.send(item)
                         }
                     }
                     if (skipped > 0) {
                         _state.update { it.copy(skipped = it.skipped + skipped) }
                     }
-                    _state.update { it.copy(queued = it.queued + fresh.size - skipped) }
                     persistQueue()
                     refresh()
                 }
@@ -171,14 +181,16 @@ class DownloadService : LifecycleService() {
                 val taken = intent.getLongArrayExtra(EXTRA_TAKEN) ?: longArrayOf()
                 lifecycleScope.launch {
                     _state.update { it.copy(failed = emptyList(), lastError = null) }
-                    var n = 0
-                    paths.forEachIndexed { i, p ->
-                        val item = DlItem(p, sizes.getOrElse(i) { 0L }, taken.getOrElse(i) { 0L })
-                        pending.add(item)
-                        queue.send(item)
-                        n++
+                    val items = paths.mapIndexed { i, p ->
+                        DlItem(p, sizes.getOrElse(i) { 0L }, taken.getOrElse(i) { 0L })
                     }
-                    _state.update { it.copy(queued = it.queued + n) }
+                    mutex.withLock {
+                        pending.addAll(items)
+                        syncQueueState()
+                    }
+                    for (item in items) {
+                        queue.send(item)
+                    }
                     persistQueue()
                     refresh()
                 }
@@ -207,6 +219,12 @@ class DownloadService : LifecycleService() {
         }
     }
 
+    /** Publish queued count + paths from the pending mirror (call under mutex). */
+    private fun syncQueueState() {
+        val paths = pending.map { it.path }.toSet()
+        _state.update { it.copy(queued = pending.size, queuedPaths = paths) }
+    }
+
     private suspend fun drain() {
         acquireLocks()
         try {
@@ -215,8 +233,8 @@ class DownloadService : LifecycleService() {
             if (store.isDone(item.path, item.sizeBytes, item.takenAt)) continue
             pending.add(item)
             queue.send(item)
-            _state.update { it.copy(queued = it.queued + 1) }
         }
+        mutex.withLock { syncQueueState() }
         for (item in queue) {
             // Pause gate: wait here (service stays foreground) until resume.
             while (_state.value.paused) {
@@ -225,16 +243,26 @@ class DownloadService : LifecycleService() {
             if (stopRequest) {
                 // Parked on disk already (active journal + queue journal);
                 // requeue the head item and end so "resume later" picks up.
-                mutex.withLock { pending.addFirst(item) }
+                mutex.withLock {
+                    pending.addFirst(item)
+                    syncQueueState()
+                }
                 persistQueueSync()
-                _state.update { it.copy(active = null, queued = pending.size) }
+                _state.update {
+                    it.copy(
+                        active = null, speedBps = 0L, parked = true,
+                        lastError = "中断しました。残り${it.queued}件は後で再開できます",
+                    )
+                }
                 refresh()
                 stopSelf()
                 return
             }
             cancelCurrent = false
-            _state.update { it.copy(queued = it.queued - 1) }
-            mutex.withLock { pending.remove(item) }
+            mutex.withLock {
+                pending.remove(item)
+                syncQueueState()
+            }
             persistQueue()
             // Journal BEFORE downloading: a crash from here on resumes
             // this file via Range. Cleared only after publish.
@@ -255,16 +283,19 @@ class DownloadService : LifecycleService() {
             } catch (e: Paused) {
                 // Requeue at head; the pause gate above will hold.
                 // Keep the active journal: pause-then-kill still resumes.
-                mutex.withLock { pending.addFirst(item) }
+                mutex.withLock {
+                    pending.addFirst(item)
+                    syncQueueState()
+                }
                 queue.send(item)
-                _state.update { it.copy(queued = it.queued + 1, active = null) }
+                _state.update { it.copy(active = null) }
                 persistQueue()
             } catch (e: Cancelled) {
-                // Stop-for-now: requeue the head item, clear the request,
-                // and let the park branch above end the service.
-                mutex.withLock { pending.addFirst(item) }
-                queue.send(item)
+                // Stop-for-now: do NOT requeue here — the park branch
+                // above requeues the head item exactly once. (Requeueing
+                // here too duplicated the item on every stop.)
                 stopRequest = true
+                queue.send(item)
                 persistQueueSync()
             } catch (e: Exception) {
                 // Transport died (AP lost?): drop the client so the
@@ -283,11 +314,14 @@ class DownloadService : LifecycleService() {
                     // Link death, not a file problem: park the head item
                     // for "resume later" instead of burning it as failed,
                     // and end the service so the AP can be re-joined.
-                    mutex.withLock { pending.addFirst(item) }
+                    mutex.withLock {
+                        pending.addFirst(item)
+                        syncQueueState()
+                    }
                     queue.send(item)
                     _state.update {
                         it.copy(
-                            queued = pending.size, active = null, linkDown = true,
+                            active = null, linkDown = true,
                             lastError = "カメラのWi-Fiが切れました。再接続して「続きから再開」できます",
                         )
                     }
@@ -695,8 +729,10 @@ class DownloadService : LifecycleService() {
             s.active != null && s.activeTotal > 0 ->
                 "${s.active.substringAfterLast('/')} " +
                     "${s.activeBytes / 1024} / ${s.activeTotal / 1024} KB" +
-                    (if (s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else "")
-            s.active != null -> s.active.substringAfterLast('/')
+                    (if (s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else "") +
+                    (if (s.queued > 0) " (残り${s.queued}件)" else "")
+            s.active != null -> s.active.substringAfterLast('/') +
+                (if (s.queued > 0) " (残り${s.queued}件)" else "")
             s.queued > 0 -> "待機中… (${s.queued}件)"
             else -> "待機中…"
         }

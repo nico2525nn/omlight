@@ -4,6 +4,12 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -34,6 +40,8 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Downloading
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.IndeterminateCheckBox
@@ -73,6 +81,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
@@ -113,6 +122,7 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
     val snack = remember { SnackbarHostState() }
     var tab by remember { mutableStateOf(0) }
     var showProps by remember { mutableStateOf(false) }
+    var showTransfer by remember { mutableStateOf(false) }
 
     // Auto-connect on cold start: zero taps when the camera AP is already
     // joined. Failures land on the gate with a retry.
@@ -212,7 +222,8 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
             }
             // Fullscreen viewer above everything (incl. sheets).
             if (vm.viewerPath != null) ViewerSheet(vm)
-            DlBanner(vm)
+            DlBanner(vm, onOpenSheet = { showTransfer = true })
+            if (showTransfer) TransferSheet(vm, onClose = { showTransfer = false })
         }
     }
 }
@@ -409,6 +420,8 @@ private fun PhotosTab(vm: CamViewModel) {
     var selected by remember { mutableStateOf(setOf<String>()) }
     val list = vm.visibleEntries
     val sections = vm.sections
+    // Hoisted: one collector for all cell download marks.
+    val dlState by DownloadService.state.collectAsState()
 
     fun toggle(path: String) {
         selected = if (path in selected) selected - path else selected + path
@@ -462,29 +475,6 @@ private fun PhotosTab(vm: CamViewModel) {
                         } else {
                             TextButton(onClick = { confirmClear = true }) { Text("予約解除") }
                         }
-                    }
-                }
-            }
-            // Resume-later banner for interrupted downloads.
-            vm.pendingResume?.let { (n, bytes) ->
-                Card(
-                    Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                    colors = androidx.compose.material3.CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
-                    ),
-                ) {
-                    Row(
-                        Modifier.padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "中断した保存が${n}件あります" +
-                                (if (bytes > 0) " (約${bytes / 1024 / 1024}MB)" else ""),
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = vm::resumePending) { Text("再開") }
-                        TextButton(onClick = vm::discardPending) { Text("破棄") }
                     }
                 }
             }
@@ -601,6 +591,7 @@ private fun PhotosTab(vm: CamViewModel) {
                                 selected = e.path in selected,
                                 selecting = selecting,
                                 saved = e.path in vm.savedPaths && e.path !in selected,
+                                dl = dlMarkFor(dlState, e.path),
                                 onTap = {
                                     if (selecting) toggle(e.path)
                                     else vm.openDetail(e.path)
@@ -616,8 +607,13 @@ private fun PhotosTab(vm: CamViewModel) {
             }
             }
         }
-        // Bottom actions.
-        Row(
+        // Bottom actions. Hidden while a transfer runs OR is parked:
+        // the slim strip owns the bottom slot then (no FAB/banner
+        // overlap). Resume/discard live in the strip + transfer sheet.
+        val dlBusy = DownloadService.state.collectAsState().value.let {
+            it.active != null || it.queued > 0 || it.parked
+        }
+        if (!dlBusy) Row(
             Modifier.align(Alignment.BottomCenter).padding(16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -709,6 +705,8 @@ private fun PhotoCell(
     selected: Boolean,
     selecting: Boolean,
     saved: Boolean,
+    /** null = none, -1 = queued, 0..1 = active progress. */
+    dl: Float?,
     onTap: () -> Unit,
     onLongPress: () -> Unit,
 ) {
@@ -792,7 +790,99 @@ private fun PhotoCell(
                     )
                 }
             }
+            // Queued mark: hollow download icon, top-end.
+            if (dl != null && dl < 0f) {
+                Box(
+                    Modifier.align(Alignment.TopEnd).padding(6.dp)
+                        .size(22.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Download, "保存待ち",
+                        Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            }
+            // Active mark: highlight pours top-to-bottom with progress,
+            // then the pulse sweep keeps moving while bytes flow.
+            if (dl != null && dl >= 0f) {
+                DownloadPour(
+                    progress = dl,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                Box(
+                    Modifier.align(Alignment.TopEnd).padding(6.dp)
+                        .size(22.dp)
+                        .clip(androidx.compose.foundation.shape.CircleShape)
+                        .background(MaterialTheme.colorScheme.primary),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        Icons.Default.Downloading, "保存中",
+                        Modifier.size(14.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
+            }
         }
+    }
+}
+
+/**
+ * Per-cell download mark: null = none, 0..1 = active progress, -1 = queued.
+ * Reads DlState once per grid (caller hoists to avoid N collectors).
+ */
+@Composable
+private fun dlMarkFor(s: com.omlight.dl.DlState, path: String): Float? {
+    if (s.active == path) {
+        if (s.activeTotal <= 0L) return 0f
+        return (s.activeBytes.toFloat() / s.activeTotal).coerceIn(0f, 1f)
+    }
+    if (path in s.queuedPaths) return -1f
+    return null
+}
+
+/**
+ * Progress pour: the filled region grows top-to-bottom with [progress],
+ * and a soft highlight band sweeps down continuously while active.
+ */
+@Composable
+private fun DownloadPour(progress: Float, modifier: Modifier = Modifier) {
+    val t by rememberInfiniteTransition(label = "pour").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(1400, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "sweep",
+    )
+    val fill = MaterialTheme.colorScheme.primary
+    Canvas(modifier) {
+        val p = progress.coerceIn(0f, 1f)
+        // Done region: translucent primary wash.
+        drawRect(
+            color = fill,
+            topLeft = androidx.compose.ui.geometry.Offset.Zero,
+            size = androidx.compose.ui.geometry.Size(size.width, size.height * p),
+            alpha = 0.30f,
+        )
+        // Sweep band over the whole cell: keeps motion visible even at
+        // 0% (handshake) and 100% (verify/publish).
+        val y = t * size.height * 1.2f - size.height * 0.1f
+        val bandH = size.height * 0.25f
+        drawRect(
+            color = fill,
+            topLeft = androidx.compose.ui.geometry.Offset(0f, (y - bandH).coerceAtLeast(0f)),
+            size = androidx.compose.ui.geometry.Size(
+                size.width,
+                (y - (y - bandH).coerceAtLeast(0f)).coerceAtMost(size.height - (y - bandH).coerceAtLeast(0f)),
+            ),
+            alpha = 0.22f,
+        )
     }
 }
 
@@ -1038,9 +1128,13 @@ private fun ZoomHoldButton(label: String, dir: OpcClient.ZoomDir, vm: CamViewMod
     }
 }
 
-/** Slim progress banner pinned above the bottom bar while downloads run. */
+/**
+ * Slim transfer strip: one line, always above the bottom bar and below
+ * the save FAB (FAB hides while busy). Queued/downloaded counts replace
+ * the old multi-row card; details live in the transfer sheet.
+ */
 @Composable
-private fun DlBanner(vm: CamViewModel) {
+private fun DlBanner(vm: CamViewModel, onOpenSheet: () -> Unit) {
     val s by DownloadService.state.collectAsState()
     // Downloads finished outside refresh(): re-check MediaStore so saved
     // veils/badges appear without a manual pull-to-refresh.
@@ -1048,83 +1142,73 @@ private fun DlBanner(vm: CamViewModel) {
         if (s.done > 0 || s.failed.isNotEmpty()) vm.reconcileSaved()
     }
     val active = s.active
-    if (active == null && s.queued == 0 && s.failed.isEmpty() && s.done == 0) return
+    // Parked (user stop / link death): the service is gone; the queue is
+    // journaled, not running. busy=false so the FAB returns and the strip
+    // shows the resume action instead of pause/stop.
+    val parkedIdle = (s.parked || s.linkDown) && active == null
+    val busy = !parkedIdle && (active != null || s.queued > 0)
+    // Idle + clean: nothing to show (saved veils + notification carry it).
+    // The strip owns the bottom slot only while busy, failed, parked,
+    // or link-parked.
+    val showable = busy || s.failed.isNotEmpty() || s.parked || (s.linkDown && s.queued > 0)
+    if (!showable) return
     val ctx = androidx.compose.ui.platform.LocalContext.current
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+    Box(
+        Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp),
+        contentAlignment = Alignment.BottomCenter,
+    ) {
         Card(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth().clickable(onClick = onOpenSheet),
         ) {
-            Column(Modifier.padding(12.dp)) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        when {
-                            s.paused -> "一時停止中"
-                            active != null -> "保存中: ${active.substringAfterLast('/')}"
-                            s.queued > 0 -> "待機中… (${s.queued}件)"
-                            else -> "完了"
-                        } + (if (active != null && s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else ""),
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f),
-                    )
-                    if (active != null || s.queued > 0) {
-                        TextButton(onClick = {
-                            if (s.paused) DownloadService.resume(ctx)
-                            else DownloadService.pause(ctx)
-                        }) {
-                            Text(if (s.paused) "再開" else "停止")
-                        }
-                        TextButton(onClick = {
-                            DownloadService.stopLater(ctx)
-                        }) {
-                            Text("中断")
-                        }
+            Row(
+                Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (busy) {
+                    DownloadingPulse(Modifier.size(20.dp))
+                    Spacer(Modifier.width(8.dp))
+                }
+                Text(
+                    when {
+                        s.paused -> "一時停止中"
+                        active != null -> active.substringAfterLast('/')
+                        s.queued > 0 && !parkedIdle -> "待機中… (${s.queued}件)"
+                        s.parked -> "中断中 — 残り${s.queued}件"
+                        s.linkDown -> "切断 — 残り${s.queued}件は保存済み"
+                        s.failed.isNotEmpty() -> "失敗 ${s.failed.size}件"
+                        else -> "完了 ${s.done}件"
+                    } + (if (active != null && s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else ""),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                )
+                if (busy) {
+                    TextButton(onClick = {
+                        if (s.paused) DownloadService.resume(ctx)
+                        else DownloadService.pause(ctx)
+                    }) {
+                        Text(if (s.paused) "再開" else "停止")
                     }
-                    if (s.failed.isNotEmpty()) {
-                        TextButton(onClick = vm::retryFailed) {
-                            Text("再試行")
-                        }
+                    TextButton(onClick = { DownloadService.stopLater(ctx) }) {
+                        Text("中断")
                     }
-                }
-                if (s.activeTotal > 0 && active != null && !s.paused) {
-                    Spacer(Modifier.height(8.dp))
-                    LinearProgressIndicator(
-                        progress = { (s.activeBytes.toFloat() / s.activeTotal).coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                if (s.done > 0 || s.failed.isNotEmpty() || s.skipped > 0) {
-                    Text(
-                        "完了 ${s.done}件" +
-                            (if (s.skipped > 0) " / スキップ ${s.skipped}件" else "") +
-                            (if (s.failed.isNotEmpty()) " / 失敗 ${s.failed.size}件" else ""),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                s.lastError?.let {
-                    Text(
-                        it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                if (s.linkDown && s.queued > 0) {
-                    Spacer(Modifier.height(4.dp))
-                    Row(
-                        Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "残り${s.queued}件は保存されています",
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.weight(1f),
-                        )
-                        TextButton(onClick = vm::resumePending) { Text("再接続して再開") }
+                } else if (s.failed.isNotEmpty()) {
+                    TextButton(onClick = vm::retryFailed) {
+                        Text("再試行")
+                    }
+                } else if ((s.parked || s.linkDown) && s.queued > 0) {
+                    TextButton(onClick = vm::resumePending) {
+                        Text(if (s.linkDown) "再接続して再開" else "続きから再開")
                     }
                 }
+            }
+            // Whole-queue progress: done / (done + queued + active + failed).
+            val total = s.queued + s.done + s.failed.size + (if (active != null) 1 else 0)
+            if (busy && total > 0) {
+                LinearProgressIndicator(
+                    progress = { (s.done.toFloat() / total).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
         }
     }
@@ -1134,6 +1218,148 @@ private fun formatSpeed(bps: Long): String = when {
     bps < 1024 -> "$bps B/s"
     bps < 1024 * 1024 -> "${bps / 1024} KB/s"
     else -> "%.1f MB/s".format(bps / 1024.0 / 1024.0)
+}
+
+/**
+ * Downloading mark: a highlight band sweeps top-to-bottom over the icon,
+ * repeating while the transfer runs.
+ */
+@Composable
+private fun DownloadingPulse(modifier: Modifier = Modifier) {
+    val t by rememberInfiniteTransition(label = "dl").animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "sweep",
+    )
+    val base = MaterialTheme.colorScheme.onSurfaceVariant
+    val hi = MaterialTheme.colorScheme.primary
+    Box(modifier, contentAlignment = Alignment.Center) {
+        Icon(Icons.Default.Downloading, "ダウンロード中", tint = base)
+        // Sweep band: alpha peaks at the moving center.
+        Canvas(Modifier.matchParentSize()) {
+            val y = t * size.height
+            val bandH = size.height * 0.45f
+            val top = (y - bandH).coerceAtLeast(0f)
+            drawRect(
+                color = hi,
+                topLeft = androidx.compose.ui.geometry.Offset(0f, top),
+                size = androidx.compose.ui.geometry.Size(size.width, (y - top).coerceAtLeast(0f)),
+                alpha = 0.35f,
+            )
+        }
+        Icon(Icons.Default.Download, null, tint = hi.copy(alpha = 0.9f))
+    }
+}
+
+/** Transfer details: counts, errors, failures, resume-later. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TransferSheet(vm: CamViewModel, onClose: () -> Unit) {
+    val s by DownloadService.state.collectAsState()
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = onClose, sheetState = sheet) {
+        Column(Modifier.padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
+            Text("保存の進行状況", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "完了 ${s.done}件" +
+                    (if (s.queued > 0) " / 待機 ${s.queued}件" else "") +
+                    (if (s.skipped > 0) " / スキップ ${s.skipped}件" else "") +
+                    (if (s.failed.isNotEmpty()) " / 失敗 ${s.failed.size}件" else ""),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            s.active?.let {
+                Text(
+                    "保存中: ${it.substringAfterLast('/')}" +
+                        (if (s.speedBps > 0) " ・ ${formatSpeed(s.speedBps)}" else ""),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (s.activeTotal > 0 && s.active != null) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(
+                    progress = { (s.activeBytes.toFloat() / s.activeTotal).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            s.lastError?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (s.failed.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Text("失敗したファイル:", style = MaterialTheme.typography.bodySmall)
+                s.failed.take(8).forEach {
+                    Text(
+                        "・${it.substringAfterLast('/')}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (s.failed.size > 8) {
+                    Text(
+                        "他 ${s.failed.size - 8}件",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val busy = s.active != null || s.queued > 0
+                if (busy) {
+                    Button(onClick = {
+                        if (s.paused) DownloadService.resume(ctx)
+                        else DownloadService.pause(ctx)
+                    }) {
+                        Text(if (s.paused) "再開" else "一時停止")
+                    }
+                    OutlinedButton(onClick = {
+                        DownloadService.stopLater(ctx)
+                        onClose()
+                    }) {
+                        Text("中断して後で")
+                    }
+                }
+                if (s.failed.isNotEmpty()) {
+                    Button(onClick = vm::retryFailed) { Text("失敗を再試行") }
+                }
+                if (s.linkDown && s.queued > 0) {
+                    Button(onClick = {
+                        vm.resumePending()
+                        onClose()
+                    }) { Text("再接続して再開") }
+                }
+            }
+            // Parked queue from an older run (service not running).
+            vm.pendingResume?.let { (n, bytes) ->
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "中断した保存が${n}件あります" +
+                            (if (bytes > 0) " (約${bytes / 1024 / 1024}MB)" else ""),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = {
+                        vm.resumePending()
+                        onClose()
+                    }) { Text("再開") }
+                    TextButton(onClick = vm::discardPending) { Text("破棄") }
+                }
+            }
+        }
+    }
 }
 
 /** Link-down strip with a manual retry. */

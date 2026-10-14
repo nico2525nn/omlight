@@ -837,7 +837,8 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
             needNotifPerm = true
         }
         DownloadService.enqueue(getApplication(), items)
-        statusMsg = "${items.size}件をダウンロード開始（バックグラウンドで継続）"
+        // No snackbar: the transfer strip + grid marks already show it
+        // (and a snackbar would cover the strip).
     }
 
     fun retryFailed() {
