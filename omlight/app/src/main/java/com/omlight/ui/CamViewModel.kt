@@ -150,6 +150,36 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
     val thumbs = mutableStateMapOf<String, Thumb>()
     /** path -> display aspect (w/h) from thumb bounds + rotation. Same lifecycle as [thumbs]. */
     private val aspectMap = mutableStateMapOf<String, Float>()
+    /** Grid zoom level: index into zoom row heights. Persisted across launches. */
+    var gridZoom by mutableStateOf(gridZoomPrefs().getInt(KEY_GRID_ZOOM, ZOOM_DEFAULT))
+        private set
+
+    fun stepGridZoom(dir: Int) {
+        setGridZoomLevel(gridZoom + dir)
+    }
+
+    private fun setGridZoomLevel(level: Int) {
+        val v = level.coerceIn(0, ZOOM_LEVELS - 1)
+        if (v == gridZoom) return
+        gridZoom = v
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                gridZoomPrefs().edit().putInt(KEY_GRID_ZOOM, v).apply()
+            } catch (_: Exception) { /* prefs best-effort */ }
+        }
+    }
+
+    private fun gridZoomPrefs() =
+        getApplication<Application>().getSharedPreferences(PREFS_UI, android.content.Context.MODE_PRIVATE)
+
+    companion object {
+        /** Grid zoom levels as target row heights (dp). Default = index 2. */
+        val ZOOM_ROW_DP = floatArrayOf(110f, 150f, 210f, 300f)
+        const val ZOOM_LEVELS = 4
+        const val ZOOM_DEFAULT = 2
+        private const val PREFS_UI = "ui"
+        private const val KEY_GRID_ZOOM = "grid_zoom"
+    }
     private val thumbStore by lazy { ThumbStore(getApplication()) }
     /** Latest liveview JPEG, or null when stopped. */
     var liveFrame: ByteArray? by mutableStateOf(null)

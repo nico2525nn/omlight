@@ -14,6 +14,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -556,19 +559,50 @@ private fun PhotosTab(vm: CamViewModel) {
                 }
                 // Justified rows (Flickr-style): cells keep their aspect,
                 // each row stretches to the full width. Row height floats
-                // (~150dp target): landscape rows come out short with few
-                // cells, portrait rows tall with more — no column count.
+                // around the zoom target: landscape rows come out short
+                // with few cells, portrait rows tall with more — no
+                // column count. Pinch anywhere steps the zoom level.
                 androidx.compose.foundation.layout.BoxWithConstraints(
                     Modifier.fillMaxSize()
+                        .pointerInput(Unit) {
+                            // Level-stepped pinch: accumulate span ratio,
+                            // fire one level per 25% past the threshold.
+                            // awaitEachGesture defers to scroll/single-finger.
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                var acc = 1f
+                                do {
+                                    val e = awaitPointerEvent()
+                                    val fingers = e.changes.count { it.pressed }
+                                    if (fingers < 2 || e.changes.isEmpty()) {
+                                        e.changes.forEach { it.consume() }
+                                        break
+                                    }
+                                    val z = e.calculateZoom()
+                                    if (!z.isNaN() && z > 0f) acc *= z
+                                    if (acc >= 1.25f) {
+                                        acc = 1f
+                                        e.changes.forEach { it.consume() }
+                                        vm.stepGridZoom(+1)
+                                    } else if (acc <= 1f / 1.25f) {
+                                        acc = 1f
+                                        e.changes.forEach { it.consume() }
+                                        vm.stepGridZoom(-1)
+                                    }
+                                } while (e.changes.any { it.pressed })
+                            }
+                        }
                 ) {
                     val density = androidx.compose.ui.platform.LocalDensity.current
                     val widthPx = with(density) { maxWidth.toPx() } - with(density) { 16.dp.toPx() }
-                    val targetPx = with(density) { 150.dp.toPx() }
+                    val targetPx = with(density) {
+                        CamViewModel.ZOOM_ROW_DP[vm.gridZoom.coerceIn(0, CamViewModel.ZOOM_LEVELS - 1)].dp.toPx()
+                    }
                     val spacingPx = with(density) { 4.dp.toPx() }
                     val spacingDp = 4.dp
                     // Pack per section so rows never mix days. Aspect reads
                     // make this recompose as thumbs (and aspects) land.
-                    val packed = remember(lookaheadAspects, widthPx) {
+                    val packed = remember(lookaheadAspects, widthPx, vm.gridZoom) {
                         lookaheadAspects.flatMap { (day, cells) ->
                             Justify.pack(
                                 cells.map { Justify.Cell(it.first, it.second) },
