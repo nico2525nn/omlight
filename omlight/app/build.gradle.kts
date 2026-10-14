@@ -21,8 +21,8 @@ android {
         applicationId = "com.omlight"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.10.1"
+        versionCode = 17
+        versionName = "0.11.0"
     }
 
     if (keystoreProps.containsKey("storeFile")) {
