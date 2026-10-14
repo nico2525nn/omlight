@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -109,6 +110,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
@@ -288,11 +291,19 @@ private fun ConnectGate(vm: CamViewModel) {
             tint = MaterialTheme.colorScheme.primary,
         )
         Spacer(Modifier.height(16.dp))
-        Text("カメラのWi-Fiに接続してから", style = MaterialTheme.typography.bodyLarge)
-        Text("「接続」を押してください", style = MaterialTheme.typography.bodyLarge)
+        // One centered block: instruction + status share the same slot
+        // so the layout never jumps between Idle and Failed.
+        Text(
+            "カメラのWi-Fiに接続してから「接続」を押してください",
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Spacer(Modifier.height(8.dp))
         if (failed != null) {
-            Spacer(Modifier.height(8.dp))
-            Text(failed, color = MaterialTheme.colorScheme.error)
+            Text(
+                failed,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+            )
             vm.diagText?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(
@@ -301,6 +312,12 @@ private fun ConnectGate(vm: CamViewModel) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        } else {
+            Text(
+                "カメラの通信だけカメラWi-Fiに流し、他の通信は遮断しません",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         Spacer(Modifier.height(24.dp))
         Button(onClick = ::doConnect) { Text("接続") }
@@ -310,6 +327,10 @@ private fun ConnectGate(vm: CamViewModel) {
         if (android.os.Build.VERSION.SDK_INT >= 29) {
             TextButton(onClick = { showAp = !showAp }) {
                 Text(if (showAp) "閉じる" else "アプリからWi-Fiに接続する")
+                Icon(
+                    if (showAp) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    null,
+                )
             }
             if (showAp) {
                 OutlinedTextField(
@@ -395,13 +416,7 @@ private fun ConnectGate(vm: CamViewModel) {
                     ) { Text("このWi-Fiに接続") }
                 }
             }
-            Spacer(Modifier.height(8.dp))
         }
-        Text(
-            "カメラの通信だけカメラWi-Fiに流し、他の通信は遮断しません",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
@@ -482,9 +497,12 @@ private fun PhotosTab(vm: CamViewModel) {
                 }
             }
             // Selection header (Photos style): × + count + select-all.
+            // Surface tint separates it from the scrolling grid below.
             if (selecting) {
                 Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                    Modifier.fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceContainer)
+                        .padding(start = 4.dp, end = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     IconButton(onClick = {
@@ -492,7 +510,7 @@ private fun PhotosTab(vm: CamViewModel) {
                         selected = emptySet()
                     }) { Icon(Icons.Default.Close, "選択を閉じる") }
                     Text(
-                        "${selected.size}件選択中",
+                        if (selected.isEmpty()) "選択中" else "${selected.size}件選択中",
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier.weight(1f),
                     )
@@ -501,10 +519,50 @@ private fun PhotosTab(vm: CamViewModel) {
                         else list.map { it.path }.toSet()
                         if (selected.isEmpty()) selecting = false
                     }) {
-                        Text(if (selected.size == list.size) "解除" else "すべて選択")
+                        Text(if (selected.size == list.size && list.isNotEmpty()) "解除" else "すべて選択")
                     }
                 }
-                HorizontalDivider()
+            } else {
+                // Sticky grid toolbar: count + filter always visible, and
+                // a zoom stepper (pinch works too, but discoverability).
+                val unsavedN = list.count { it.path !in vm.savedPaths }
+                Row(
+                    Modifier.fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        when {
+                            list.isEmpty() -> "写真"
+                            unsavedN in 1..<list.size -> "${list.size}件 (未保存$unsavedN)"
+                            unsavedN == 0 -> "${list.size}件 (保存済み)"
+                            else -> "${list.size}件"
+                        },
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (vm.filterDate != null) {
+                        FilterChip(
+                            selected = true,
+                            onClick = { vm.selectFilterDate(null) },
+                            label = { Text(vm.filterDate!!) },
+                            trailingIcon = { Icon(Icons.Default.Close, "フィルタ解除") },
+                        )
+                        Spacer(Modifier.width(4.dp))
+                    }
+                    IconButton(
+                        onClick = { vm.stepGridZoom(-1) },
+                        enabled = vm.gridZoom > 0,
+                        modifier = Modifier.size(40.dp),
+                    ) { Icon(Icons.Default.Remove, "一覧を小さく") }
+                    IconButton(
+                        onClick = { vm.stepGridZoom(+1) },
+                        enabled = vm.gridZoom < CamViewModel.ZOOM_LEVELS - 1,
+                        modifier = Modifier.size(40.dp),
+                    ) { Icon(Icons.Default.Add, "一覧を大きく") }
+                }
             }
             PullToRefreshBox(vm.refreshing, onRefresh = vm::refresh, Modifier.weight(1f).fillMaxWidth()) {
             if (list.isEmpty() && !vm.refreshing) {
@@ -624,20 +682,25 @@ private fun PhotosTab(vm: CamViewModel) {
                                 val items = sections.first { it.first == day }.second
                                 item(key = "hdr-$day") {
                                     // Day header: label + round check toggle (Photos style).
+                                    // TextButton hit area (48dp) instead of a
+                                    // bare icon: easier to hit, no dead space.
                                     val allSel = items.all { it.path in selected }
                                     val someSel = !allSel && items.any { it.path in selected }
                                     Row(
-                                        Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                        Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 2.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                     ) {
                                         Text(
                                             vm.dayLabel(day),
                                             style = MaterialTheme.typography.titleSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             modifier = Modifier.weight(1f),
                                         )
-                                        IconButton(onClick = {
-                                            selectDay(day, items.map { it.path })
-                                        }) {
+                                        TextButton(
+                                            onClick = { selectDay(day, items.map { it.path }) },
+                                            contentPadding = PaddingValues(0.dp),
+                                            modifier = Modifier.size(48.dp),
+                                        ) {
                                             SelectRing(
                                                 state = when {
                                                     allSel -> 2
@@ -702,9 +765,8 @@ private fun PhotosTab(vm: CamViewModel) {
         val dlBusy = DownloadService.state.collectAsState().value.let {
             it.active != null || it.queued > 0 || it.parked
         }
-        if (!dlBusy) Row(
+        if (!dlBusy) Box(
             Modifier.align(Alignment.BottomCenter).padding(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (selecting) {
                 ExtendedFloatingActionButton(
@@ -717,25 +779,14 @@ private fun PhotosTab(vm: CamViewModel) {
                     text = { Text("選択を保存 (${selected.size})") },
                 )
             } else if (list.isNotEmpty()) {
+                // One verb, always: "保存 N". Scope (day/all) lives in
+                // the toolbar count above — the FAB never re-explains it.
                 val unsaved = list.filter { it.path !in vm.savedPaths }
+                val targets = if (unsaved.isNotEmpty()) unsaved else list
                 ExtendedFloatingActionButton(
-                    onClick = {
-                        val targets = if (unsaved.isNotEmpty()) unsaved else list
-                        vm.download(targets.map { it.path })
-                    },
+                    onClick = { vm.download(targets.map { it.path }) },
                     icon = { Icon(Icons.Default.CloudDownload, null) },
-                    text = {
-                        Text(
-                            when {
-                                vm.filterDate != null && unsaved.isNotEmpty() ->
-                                    "この日の未保存を保存 (${unsaved.size})"
-                                vm.filterDate != null -> "この日を保存"
-                                unsaved.isNotEmpty() && unsaved.size != list.size ->
-                                    "未保存を保存 (${unsaved.size})"
-                                else -> "すべて保存"
-                            }
-                        )
-                    },
+                    text = { Text("保存 ${targets.size}") },
                 )
             }
         }
@@ -827,49 +878,40 @@ private fun PhotoCell(
                     CircularProgressIndicator(Modifier.size(24.dp))
                 }
             }
-            // Saved veil: dim the whole cell like stock (downloaded =
-            // quieter). Sits under the badges, above the image.
+            // Saved veil: dim the cell like stock (downloaded =
+            // quieter). Lighter than before: 0.30 keeps the photo
+            // readable while still separating saved from new.
             if (saved && !selected) {
                 Box(
                     Modifier.fillMaxSize()
-                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.38f))
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.30f))
                 )
             }
             if (entry.isMovie) {
-                Icon(
-                    Icons.Default.Movie, "動画",
-                    Modifier.align(Alignment.BottomStart).padding(4.dp),
-                    tint = MaterialTheme.colorScheme.onPrimary,
+                CellPill(
+                    text = "動画",
+                    modifier = Modifier.align(Alignment.BottomStart).padding(6.dp),
                 )
             }
-            // RAW badge: bottom-left pill. Movies show the film icon
+            // RAW badge: bottom-left pill. Movies show the movie pill
             // instead (never both at once).
             if (entry.isRaw && !entry.isMovie) {
-                Box(
-                    Modifier.align(Alignment.BottomStart).padding(6.dp)
-                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
-                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f))
-                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        "RAW",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                }
+                CellPill(
+                    text = "RAW",
+                    modifier = Modifier.align(Alignment.BottomStart).padding(6.dp),
+                )
             }
-            // Saved badge: verified in MediaStore.
-            if (saved) {
-                Box(
-                    Modifier.align(Alignment.BottomEnd).padding(6.dp)
-                        .size(22.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(MaterialTheme.colorScheme.primary),
-                    contentAlignment = Alignment.Center,
+            // Saved badge: verified in MediaStore. Bottom-end dot with a
+            // check (same slot as the queued/active dots: one badge per
+            // corner, never stacked).
+            if (saved && dl == null) {
+                CellDot(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp),
+                    filled = true,
+                    desc = "保存済み",
                 ) {
                     Icon(
-                        Icons.Default.CloudDownload, "保存済み",
+                        Icons.Default.Check, null,
                         Modifier.size(14.dp),
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
@@ -889,17 +931,15 @@ private fun PhotoCell(
                     )
                 }
             }
-            // Queued mark: hollow download icon, top-end.
+            // Queued mark: scrim dot, top-end (same slot as active).
             if (dl != null && dl < 0f) {
-                Box(
-                    Modifier.align(Alignment.TopEnd).padding(6.dp)
-                        .size(22.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f)),
-                    contentAlignment = Alignment.Center,
+                CellDot(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+                    filled = false,
+                    desc = "保存待ち",
                 ) {
                     Icon(
-                        Icons.Default.Download, "保存待ち",
+                        Icons.Default.Download, null,
                         Modifier.size(14.dp),
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
@@ -912,21 +952,64 @@ private fun PhotoCell(
                     progress = dl,
                     modifier = Modifier.fillMaxSize(),
                 )
-                Box(
-                    Modifier.align(Alignment.TopEnd).padding(6.dp)
-                        .size(22.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(MaterialTheme.colorScheme.primary),
-                    contentAlignment = Alignment.Center,
+                CellDot(
+                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+                    filled = true,
+                    desc = "保存中",
                 ) {
                     Icon(
-                        Icons.Default.Downloading, "保存中",
+                        Icons.Default.Downloading, null,
                         Modifier.size(14.dp),
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
                 }
             }
         }
+    }
+}
+
+/** Bottom-left text pill for cell type marks (RAW / movie). */
+@Composable
+private fun CellPill(text: String, modifier: Modifier = Modifier) {
+    Box(
+        modifier
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(4.dp))
+            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onPrimary,
+        )
+    }
+}
+
+/** 22dp status dot for cell corners. Filled = primary, hollow = scrim. */
+@Composable
+private fun CellDot(
+    modifier: Modifier = Modifier,
+    filled: Boolean,
+    desc: String,
+    content: @Composable () -> Unit,
+) {
+    Box(
+        modifier
+            .size(22.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(
+                if (filled) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.scrim.copy(alpha = 0.55f)
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        // Accessibility label lives on the dot; glyph is decorative.
+        Box(
+            androidx.compose.ui.Modifier.semantics(mergeDescendants = true) {
+                contentDescription = desc
+            }
+        ) { content() }
     }
 }
 
@@ -994,8 +1077,9 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
     ) {
         // Liveview frame, last shot, or placeholder.
         // Tap liveview = AF lock at that point (tap again to release).
+        // 16:9 matches the LV stream: no letterbox, no crop.
         Card(
-            Modifier.fillMaxWidth().aspectRatio(4f / 3f)
+            Modifier.fillMaxWidth().aspectRatio(16f / 9f)
                 .pointerInput(vm.liveFrame != null) {
                     detectTapGestures { off ->
                         if (vm.liveFrame != null && !vm.shooting) {
@@ -1060,13 +1144,11 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
                 }
             }
         }
-        vm.captureState?.let {
-            Spacer(Modifier.height(4.dp))
-            Text(it, style = MaterialTheme.typography.bodyMedium)
-        }
         Spacer(Modifier.height(12.dp))
+        // Shutter cluster: LV toggle + big shutter + record. Fixed
+        // heights so the row never jumps when captureState appears.
         Row(
-            Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth().height(84.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -1094,11 +1176,20 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
                 )
             }
         }
-        if (vm.recording) {
-            Spacer(Modifier.height(8.dp))
-            Text("● 録画中", color = MaterialTheme.colorScheme.error)
+        // Status line: fixed height, recording/shooting/capture share it.
+        Box(
+            Modifier.fillMaxWidth().height(24.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            when {
+                vm.recording -> Text("● 録画中", color = MaterialTheme.colorScheme.error)
+                vm.captureState != null -> Text(
+                    vm.captureState!!,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
         }
-        Spacer(Modifier.height(12.dp))
+        // Zoom rail: W [slider-ish hold buttons] T on one line.
         // Hold-to-zoom (optical). Buttons repeat start/stop on press.
         Row(
             Modifier.fillMaxWidth(),
@@ -1106,9 +1197,23 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             ZoomHoldButton("W", OpcClient.ZoomDir.WIDE, vm)
-            // Quick settings: the 3 most-touched props inline.
-            QuickProp(vm, "expcomp", "露出")
+            Text(
+                "ズーム (長押し・ダブルタップで端まで)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             ZoomHoldButton("T", OpcClient.ZoomDir.TELE, vm)
+        }
+        Spacer(Modifier.height(8.dp))
+        // Quick settings: the 3 most-touched props inline.
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            QuickProp(vm, "expcomp", "露出")
+            QuickProp(vm, "isospeedvalue", "ISO")
+            QuickProp(vm, "wbvalue", "WB")
         }
         Spacer(Modifier.height(8.dp))
         Row(
@@ -1116,7 +1221,6 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            QuickProp(vm, "isospeedvalue", "ISO")
             if (vm.selfTimerSupported) {
                 FilledIconButton(
                     onClick = vm::toggleSelfTimer,
@@ -1129,31 +1233,17 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
                     )
                 }
             }
-            QuickProp(vm, "wbvalue", "WB")
-        }
-        Spacer(Modifier.height(8.dp))
-        // Interval shoot: preset chips or stop while running.
-        if (vm.intervalLeft > 0) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            // Interval shoot: preset chips or stop while running.
+            if (vm.intervalLeft > 0) {
                 Text(
                     "残り ${vm.intervalLeft} 枚",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Spacer(Modifier.width(8.dp))
                 Button(onClick = vm::stopInterval) { Text("中止") }
-            }
-        } else {
-            var count by remember { mutableStateOf(10) }
-            var secs by remember { mutableStateOf(5) }
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
+            } else {
+                var count by remember { mutableStateOf(10) }
+                var secs by remember { mutableStateOf(5) }
                 Text("連写", style = MaterialTheme.typography.bodySmall)
                 FilterChip(
                     selected = false,
@@ -1171,36 +1261,38 @@ private fun ShootTab(vm: CamViewModel, onSeePhotos: () -> Unit) {
     }
 }
 
-/** Inline +/- stepper for one camera prop (loads props on demand). */
+/** Inline -/value/+ stepper for one camera prop (loads props on demand). */
 @Composable
 private fun QuickProp(vm: CamViewModel, name: String, label: String) {
     val prop = vm.props.firstOrNull { it.name == name }
     LaunchedEffect(Unit) {
         if (vm.props.isEmpty() && !vm.propsLoading) vm.loadProps()
     }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("$label ", style = MaterialTheme.typography.bodySmall)
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, style = MaterialTheme.typography.labelSmall)
         val values = prop?.values.orEmpty()
         val idx = values.indexOf(prop?.value)
-        FilledIconButton(
-            onClick = {
-                if (idx > 0) vm.setProp(name, values[idx - 1])
-            },
-            modifier = Modifier.size(40.dp),
-            enabled = prop?.writable == true && idx > 0,
-        ) { Text("−") }
-        Text(
-            prop?.value ?: "…",
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.padding(horizontal = 4.dp),
-        )
-        FilledIconButton(
-            onClick = {
-                if (idx >= 0 && idx + 1 < values.size) vm.setProp(name, values[idx + 1])
-            },
-            modifier = Modifier.size(40.dp),
-            enabled = prop?.writable == true && idx >= 0 && idx + 1 < values.size,
-        ) { Text("＋") }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            FilledIconButton(
+                onClick = {
+                    if (idx > 0) vm.setProp(name, values[idx - 1])
+                },
+                modifier = Modifier.size(36.dp),
+                enabled = prop?.writable == true && idx > 0,
+            ) { Text("−") }
+            Text(
+                prop?.value ?: "…",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
+            FilledIconButton(
+                onClick = {
+                    if (idx >= 0 && idx + 1 < values.size) vm.setProp(name, values[idx + 1])
+                },
+                modifier = Modifier.size(36.dp),
+                enabled = prop?.writable == true && idx >= 0 && idx + 1 < values.size,
+            ) { Text("＋") }
+        }
     }
 }
 
@@ -1495,8 +1587,13 @@ private fun DetailSheet(vm: CamViewModel) {
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var confirmDelete by remember { mutableStateOf(false) }
     ModalBottomSheet(onDismissRequest = vm::closeDetail, sheetState = sheet) {
-        Column(Modifier.padding(16.dp)) {
-            Text(path.substringAfterLast('/'), style = MaterialTheme.typography.titleMedium)
+        Column(Modifier.padding(horizontal = 16.dp).padding(top = 4.dp, bottom = 24.dp)) {
+            // Header: name + type on one block, movie length inline.
+            Text(
+                path.substringAfterLast('/'),
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+            )
             vm.detailMovieLen?.let {
                 Text(
                     "動画 $it",
@@ -1515,21 +1612,42 @@ private fun DetailSheet(vm: CamViewModel) {
                 val jpeg = vm.detailJpeg
                 if (jpeg != null) {
                     ThumbImage(Thumb(jpeg, 0), path, Modifier.fillMaxSize(), ContentScale.Fit)
+                    // Seed phase (grid thumb shown, preview loading):
+                    // spinner veil so the user knows it's sharpening.
+                    if (vm.detailLoading) {
+                        Box(
+                            Modifier.fillMaxSize()
+                                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.25f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            CircularProgressIndicator(Modifier.size(28.dp))
+                        }
+                    }
                 } else {
                     CircularProgressIndicator()
                 }
             }
             Spacer(Modifier.height(12.dp))
-            // RGB histogram under the preview.
+            // Primary action first: one thumb-reach button, full width.
+            Button(
+                onClick = { vm.download(listOf(path)) },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Icon(Icons.Default.CloudDownload, null)
+                Spacer(Modifier.width(8.dp))
+                Text("この写真を保存")
+            }
+            // RGB histogram under the action.
             vm.detailHist?.let { hist ->
                 if (!hist.isEmpty) {
+                    Spacer(Modifier.height(12.dp))
                     HistogramGraph(hist)
-                    Spacer(Modifier.height(8.dp))
                 }
             }
             // Shooting + color info, collapsible.
             val info = vm.detailInfo
             if (!info.isEmpty) {
+                Spacer(Modifier.height(8.dp))
                 var expanded by remember(path) { mutableStateOf(false) }
                 // Headline: exposure trio always visible.
                 val head = info.rows.filter {
@@ -1539,18 +1657,19 @@ private fun DetailSheet(vm: CamViewModel) {
                     Modifier.fillMaxWidth()
                         .clip(MaterialTheme.shapes.small)
                         .clickable { expanded = !expanded }
-                        .padding(vertical = 6.dp),
+                        .padding(vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
                         Icons.Default.Info, null,
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    Spacer(Modifier.width(8.dp))
+                    Spacer(Modifier.width(12.dp))
                     Text(
                         head.ifEmpty { "撮影情報" },
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f),
+                        maxLines = 1,
                     )
                     Icon(
                         if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
@@ -1558,7 +1677,7 @@ private fun DetailSheet(vm: CamViewModel) {
                     )
                 }
                 if (expanded) {
-                    Column(Modifier.padding(start = 32.dp)) {
+                    Column(Modifier.padding(start = 36.dp, bottom = 4.dp)) {
                         info.rows.forEach { (k, v) ->
                             Row(
                                 Modifier.fillMaxWidth().padding(vertical = 2.dp),
@@ -1567,36 +1686,40 @@ private fun DetailSheet(vm: CamViewModel) {
                                     k,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.width(130.dp),
+                                    modifier = Modifier.width(110.dp),
                                 )
-                                Text(v, style = MaterialTheme.typography.bodySmall)
+                                Text(
+                                    v,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
+                                )
                             }
                         }
                     }
                 }
-                Spacer(Modifier.height(4.dp))
             }
-            if (confirmDelete) {
-                Text("カメラから削除しますか? この操作は取り消せません。")
-                Spacer(Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = {
-                        confirmDelete = false
-                        vm.deleteDetail()
-                    }) { Text("削除する") }
-                    TextButton(onClick = { confirmDelete = false }) { Text("やめる") }
-                }
-            } else {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                ) {
-                    TextButton(onClick = { vm.download(listOf(path)) }) {
-                        Icon(Icons.Default.CloudDownload, null)
-                        Text("保存")
+            // Danger zone: delete/protect exist only on some bodies
+            // (E-M5 II: no). Separated from the primary action so a
+            // mis-tap never arms delete.
+            if (vm.adminSupported) {
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(4.dp))
+                if (confirmDelete) {
+                    Text("カメラから削除しますか? この操作は取り消せません。")
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = {
+                            confirmDelete = false
+                            vm.deleteDetail()
+                        }) { Text("削除する") }
+                        TextButton(onClick = { confirmDelete = false }) { Text("やめる") }
                     }
-                    // Delete/protect exist only on some bodies (E-M5 II: no).
-                    if (vm.adminSupported) {
+                } else {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Start,
+                    ) {
                         TextButton(onClick = { vm.protectDetail(true) }) {
                             Icon(Icons.Default.Lock, null)
                             Text("保護")
@@ -1605,6 +1728,7 @@ private fun DetailSheet(vm: CamViewModel) {
                             Icon(Icons.Default.LockOpen, null)
                             Text("解除")
                         }
+                        Spacer(Modifier.weight(1f))
                         TextButton(
                             onClick = { confirmDelete = true },
                             colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
@@ -1617,7 +1741,6 @@ private fun DetailSheet(vm: CamViewModel) {
                     }
                 }
             }
-            Spacer(Modifier.height(24.dp))
         }
     }
 }
@@ -1628,8 +1751,10 @@ private fun DetailSheet(vm: CamViewModel) {
 private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
     val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = false)
     ModalBottomSheet(onDismissRequest = onClose, sheetState = sheet) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(horizontal = 16.dp).padding(top = 4.dp, bottom = 24.dp)) {
             Text("カメラ設定", style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(4.dp))
+            // Status block: card + slot on compact rows.
             vm.cardFree?.let {
                 Text(
                     "カード空き: $it",
@@ -1646,6 +1771,23 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                         modifier = Modifier.weight(1f),
                     )
                     TextButton(onClick = vm::toggleSlot) { Text("切替") }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            // MySet first (safe), power last (dangerous). One row each.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = vm::mysetBackup) {
+                    Text("設定を保存")
+                }
+                TextButton(onClick = vm::mysetRestore) {
+                    Text("設定を復元")
+                }
+                vm.mysetMsg?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
             var confirmPower by remember { mutableStateOf<String?>(null) }
@@ -1665,34 +1807,26 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
                 }
             } else {
                 Row {
-                    TextButton(onClick = { confirmPower = "off" }) {
+                    TextButton(
+                        onClick = { confirmPower = "off" },
+                        colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
                         Icon(Icons.Default.PowerSettingsNew, null)
                         Text("カメラの電源を切る")
                     }
                     TextButton(onClick = { confirmPower = "reboot" }) {
                         Text("再起動")
                     }
+                    Spacer(Modifier.weight(1f))
                     TextButton(onClick = vm::clearHistory) {
                         Text("保存履歴をクリア")
                     }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    TextButton(onClick = vm::mysetBackup) {
-                        Text("設定を保存")
-                    }
-                    TextButton(onClick = vm::mysetRestore) {
-                        Text("設定を復元")
-                    }
-                    vm.mysetMsg?.let {
-                        Text(
-                            it,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
             }
             Spacer(Modifier.height(8.dp))
+            HorizontalDivider()
             if (vm.propsLoading) {
                 Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
@@ -1764,6 +1898,9 @@ private fun PropsSheet(vm: CamViewModel, onClose: () -> Unit) {
  */
 @Composable
 private fun SelectRing(state: Int, desc: String, overImage: Boolean = false) {
+    // 26dp glyph. Touch target is the caller's job: the day header
+    // wraps this in a 48dp button; grid cells are display-only (the
+    // whole cell is already tappable).
     val filled = state == 2
     Box(
         Modifier

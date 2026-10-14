@@ -118,12 +118,30 @@ def add_photo(tag: str, folder: str = "/DCIM/100OLYMP", raw: bool = False) -> di
     return ROLL[-1]
 
 
+def add_movie(tag: str, folder: str = "/DCIM/100OLYMP") -> dict:
+    n = len(ROLL) + 1
+    name = f"P{n:06d}.MOV"
+    # Fake 4K MP4: ftyp + padding. NOT playable; the app only reads the
+    # X-Movie-Size/Sec thumb headers + CGI for movies, never the bytes.
+    full = b"\x00\x00\x00\x18ftypmp42" + bytes(60000)
+    ROLL.append({
+        "name": name, "dir": folder,
+        "bytes": full,
+        "thumb": make_jpeg(160, 120, name, 40 + n * 37),
+        "screen": make_jpeg(640, 480, name, 40 + n * 37, exif=True),
+        "movie": True,
+    })
+    return ROLL[-1]
+
+
 def seed_roll(count: int) -> None:
     for i in range(count):
         # Mix: every 4th is ORF, second half lives in 101OLYMP
         # (same basenames across folders exercise temp-file collisions).
         folder = "/DCIM/101OLYMP" if i >= count // 2 else "/DCIM/100OLYMP"
         add_photo("seed", folder, raw=(i % 4 == 3))
+    # One trailing 4K movie: exercises X-Movie-Size/Sec headers.
+    add_movie("seed", "/DCIM/101OLYMP")
 
 
 # DCF date/time pack (spec section 6)
@@ -344,8 +362,12 @@ class H(BaseHTTPRequestHandler):
             # Vary rotation like real rolls: portrait shots come back 6/8.
             n = ROLL.index(r) if r in ROLL else 0
             rot = ("6", "1", "8", "1")[n % 4]
-            self._send(200, "image/jpeg", r["thumb"],
-                        {"X-Rotation-Info": rot})
+            headers = {"X-Rotation-Info": rot}
+            if r.get("movie"):
+                # Original is 4K; previews/screens are small transcodes.
+                headers["X-Movie-Size"] = "3840x2160"
+                headers["X-Movie-Sec"] = "42"
+            self._send(200, "image/jpeg", r["thumb"], headers)
         elif p == "/get_screennail.cgi":
             if ARGS.em10:
                 self._send(404, "text/plain", b"no such cgi")

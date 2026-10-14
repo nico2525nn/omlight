@@ -932,10 +932,16 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
         // the new request instead, forcing a third tap).
         detailJob?.cancel()
         detailPath = path
-        detailJpeg = null
+        // Seed with the grid thumb: the sheet shows *something* instantly
+        // (160x120 blurred into the 4:3 box) while the 1920 preview loads.
+        // Same pattern as stock's TransPager: never a bare spinner.
+        detailJpeg = thumbs[path]?.jpeg
         detailMovieLen = null
         detailInfo = com.omlight.cam.PhotoInfo()
         detailHist = null
+        thumbs[path]?.jpeg?.let { seed ->
+            viewModelScope.launch { detailHist = Histogram.of(seed) }
+        }
         detailJob = viewModelScope.launch {
             val c = client() ?: return@launch
             detailLoading = true
@@ -946,10 +952,21 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 // Histogram off the same bytes (cheap, no extra request).
                 launch { detailHist = Histogram.of(jpeg) }
                 if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
-                    val sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }
-                    val info = withContext(Dispatchers.IO) { c.movieInfo(path) }
-                    if (detailPath != path || !isActive) return@launch
-                    val size = info["moviesize"] ?: info["size"]
+                    // Thumb headers first: X-Movie-Size/Sec carry the
+                    // ORIGINAL resolution + length (no request, instant).
+                    // CGI is the fallback for thumbs fetched before this
+                    // version (no sidecar) or header-less bodies.
+                    val th = thumbs[path]
+                    var sec = th?.movieSec ?: -1
+                    var size = th?.movieSize
+                    if (sec <= 0 || size == null) {
+                        sec = withContext(Dispatchers.IO) { c.movieSeconds(path) }.takeIf { it > 0 } ?: sec
+                        val info = withContext(Dispatchers.IO) { c.movieInfo(path) }
+                        if (detailPath != path || !isActive) return@launch
+                        size = size ?: info["moviesize"] ?: info["size"]
+                    } else if (detailPath != path || !isActive) {
+                        return@launch
+                    }
                     detailMovieLen = when {
                         sec > 0 && size != null -> "%d:%02d ・ %s".format(sec / 60, sec % 60, size)
                         sec > 0 -> "%d:%02d".format(sec / 60, sec % 60)
@@ -960,7 +977,15 @@ class CamViewModel(app: Application) : AndroidViewModel(app) {
                 // EXIF parse is CPU-bound; CGI fetch is IO. Both best-effort.
                 val info = withContext(Dispatchers.IO) { c.photoInfo(path, jpeg) }
                 if (detailPath != path || !isActive) return@launch
-                detailInfo = info
+                // Movies: drop the preview-EXIF size row. The preview is a
+                // 1920-or-smaller transcode, so its EXIF dimensions lie
+                // (a 4K original shows as FullHD). detailMovieLen above
+                // carries the true resolution from X-Movie-Size.
+                detailInfo = if (path.substringAfterLast('.', "").uppercase() in setOf("MOV", "AVI", "MP4")) {
+                    com.omlight.cam.PhotoInfo(info.rows.filter { it.first != "サイズ" })
+                } else {
+                    info
+                }
                 synchronized(detailCache) {
                     detailCache[path] = DetailBundle(jpeg, detailMovieLen, detailInfo)
                 }

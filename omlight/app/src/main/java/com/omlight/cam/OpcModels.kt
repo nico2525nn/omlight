@@ -47,14 +47,24 @@ data class CamEntry(
  * rotation together from fetch through disk/memory cache to display.
  * [degrees] is one of 0/90/180/270.
  */
-data class Thumb(val jpeg: ByteArray, val degrees: Int) {
+data class Thumb(
+    val jpeg: ByteArray,
+    val degrees: Int,
+    /** Original movie resolution from `X-Movie-Size` ("WxH"), null when n/a. */
+    val movieSize: String? = null,
+    /** Movie length seconds from `X-Movie-Sec`, null when n/a. */
+    val movieSec: Int? = null,
+) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is Thumb) return false
-        return degrees == other.degrees && jpeg.contentEquals(other.jpeg)
+        return degrees == other.degrees && jpeg.contentEquals(other.jpeg) &&
+            movieSize == other.movieSize && movieSec == other.movieSec
     }
 
-    override fun hashCode(): Int = 31 * degrees + jpeg.contentHashCode()
+    override fun hashCode(): Int =
+        31 * (31 * degrees + jpeg.contentHashCode()) + (movieSize?.hashCode() ?: 0) * 31 +
+            (movieSec ?: 0)
 
     companion object {
         /** `X-Rotation-Info` header (EXIF 1/3/6/8) -> clockwise degrees. */

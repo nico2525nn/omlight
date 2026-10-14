@@ -254,7 +254,12 @@ class OpcClient(private val t: OpcTransport) {
         ensureMode(Mode.PLAY)
         t.get("get_thumbnail.cgi", "DIR" to path).use { r ->
             if (!r.isSuccessful) throw OpcTransport.statusError(r, "thumbnail")
-            return Thumb(r.body!!.bytes(), Thumb.degreesFor(r.header("X-Rotation-Info")))
+            return Thumb(
+                r.body!!.bytes(),
+                Thumb.degreesFor(r.header("X-Rotation-Info")),
+                movieSize = r.header("X-Movie-Size")?.trim()?.takeIf { it.matches(Regex("""\d+x\d+""")) },
+                movieSec = r.header("X-Movie-Sec")?.trim()?.toIntOrNull(),
+            )
         }
     }
 

@@ -12,7 +12,10 @@ import java.security.MessageDigest
  *
  * Rotation rides in a sidecar (`<hash>.rot`, plain degrees text): the
  * JPEG bytes alone can't carry it, and re-reading EXIF per bind is
- * wasteful. Missing sidecar = upright (legacy entries).
+ * wasteful. Missing sidecar = upright (legacy entries). Movie headers
+ * (`X-Movie-Size`/`X-Movie-Sec`) ride in a second sidecar (`<hash>.mov`,
+ * "WxH|sec"): without it a cached thumb would lose the original
+ * resolution after process death.
  *
  * Bounded: 2000 files / 64MB, LRU by last-modified. Eviction runs on write
  * (amortized cheap: only scans when over budget).
@@ -30,7 +33,8 @@ class ThumbStore(ctx: Context) {
                     .takeIf { it.exists() }
                     ?.readText()?.trim()?.toIntOrNull()
                     ?.takeIf { it == 90 || it == 180 || it == 270 } ?: 0
-                Thumb(f.readBytes(), deg)
+                val (ms, msec) = movFor(path, size)
+                Thumb(f.readBytes(), deg, ms, msec)
             } else null
         } catch (_: Exception) {
             null
@@ -44,8 +48,28 @@ class ThumbStore(ctx: Context) {
             val sc = sidecarFor(path, size)
             if (thumb.degrees != 0) sc.writeText(thumb.degrees.toString())
             else sc.delete()
+            val mc = movFileFor(path, size)
+            if (thumb.movieSize != null || thumb.movieSec != null) {
+                mc.writeText("${thumb.movieSize.orEmpty()}|${thumb.movieSec ?: ""}")
+            } else {
+                mc.delete()
+            }
             evictIfNeeded()
         } catch (_: Exception) { /* cache is best-effort */ }
+    }
+
+    private fun movFor(path: String, size: Long): Pair<String?, Int?> {
+        return try {
+            val raw = movFileFor(path, size).takeIf { it.exists() }?.readText()?.trim()
+                ?: return null to null
+            val (ms, sec) = raw.split("|", limit = 2).let {
+                (it.getOrNull(0).orEmpty() to it.getOrNull(1).orEmpty())
+            }
+            val sizeOk = ms.takeIf { it.matches(Regex("""\d+x\d+""")) }
+            sizeOk to sec.toIntOrNull()
+        } catch (_: Exception) {
+            null to null
+        }
     }
 
     fun clear() {
@@ -59,6 +83,9 @@ class ThumbStore(ctx: Context) {
 
     private fun sidecarFor(path: String, size: Long): File =
         File(dir, hashOf(path, size) + ".rot")
+
+    private fun movFileFor(path: String, size: Long): File =
+        File(dir, hashOf(path, size) + ".mov")
 
     private fun hashOf(path: String, size: Long): String {
         val md = MessageDigest.getInstance("SHA-256")
