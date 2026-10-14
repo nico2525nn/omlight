@@ -148,6 +148,45 @@ object PhotoInfoParse {
         return PhotoInfo(cgi.rows + exif.rows.filter { it.first !in seen })
     }
 
+    /** Drop the size row (preview transcodings report lying dimensions). */
+    fun PhotoInfo.withoutSize(): PhotoInfo =
+        PhotoInfo(rows.filter { it.first != "サイズ" })
+
+    /**
+     * JPEG dimensions from SOF markers (SOF0-SOF15 except DHT/DAC).
+     * Reads the actual frame header, not EXIF tags: works even when
+     * ExifInterface drops PixelXDimension on truncated heads, and
+     * always reflects the bytes at hand. Null when no SOF found.
+     */
+    fun jpegDims(jpeg: ByteArray): Pair<Int, Int>? {
+        try {
+            var i = 2 // skip SOI
+            while (i + 9 < jpeg.size) {
+                if (jpeg[i].toInt() and 0xFF != 0xFF) {
+                    i++
+                    continue
+                }
+                val m = jpeg[i + 1].toInt() and 0xFF
+                // SOF0-SOF15 minus C4 (DHT), C8 (JPG), CC (DAC).
+                if (m in 0xC0..0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+                    val h = ((jpeg[i + 5].toInt() and 0xFF) shl 8) or (jpeg[i + 6].toInt() and 0xFF)
+                    val w = ((jpeg[i + 7].toInt() and 0xFF) shl 8) or (jpeg[i + 8].toInt() and 0xFF)
+                    if (w > 0 && h > 0 && w <= 65535 && h <= 65535) return w to h
+                    return null
+                }
+                if (m == 0xD8 || m == 0xD9 || (m in 0xD0..0xD7) || m == 0x01) {
+                    i += 2 // standalone markers
+                    continue
+                }
+                if (i + 3 >= jpeg.size) return null
+                val len = ((jpeg[i + 2].toInt() and 0xFF) shl 8) or (jpeg[i + 3].toInt() and 0xFF)
+                if (len < 2) return null
+                i += 2 + len
+            }
+        } catch (_: Exception) { /* malformed: fall through */ }
+        return null
+    }
+
     /**
      * Minimal TIFF/ORF IFD reader for original-file heads. ExifInterface
      * cannot parse ORF; this extracts the shooting basics (model, exposure

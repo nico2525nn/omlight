@@ -46,6 +46,7 @@ import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Downloading
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.IndeterminateCheckBox
@@ -53,6 +54,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Movie
+import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PowerSettingsNew
@@ -129,6 +131,10 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
     var tab by remember { mutableStateOf(0) }
     var showProps by remember { mutableStateOf(false) }
     var showTransfer by remember { mutableStateOf(false) }
+    // Strip dismissed by swipe: stays hidden until the transfer state
+    // changes phase (busy->parked, new enqueue, ...). The top-bar
+    // status dot keeps it reachable.
+    var stripGone by remember { mutableStateOf(false) }
 
     // Auto-connect on cold start: zero taps when the camera AP is already
     // joined. Failures land on the gate with a retry.
@@ -140,6 +146,13 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
     val dlFinished by DownloadService.state.collectAsState()
     LaunchedEffect(dlFinished.active, dlFinished.queued) {
         if (dlFinished.active == null && dlFinished.queued == 0) vm.checkResume()
+    }
+    // Downloads finished outside refresh(): re-check MediaStore so saved
+    // veils/badges appear without a manual pull-to-refresh. Lives here
+    // (not in DlBanner): the strip can be swiped away mid-transfer but
+    // reconcile must keep running.
+    LaunchedEffect(dlFinished.done, dlFinished.failed.size) {
+        if (dlFinished.done > 0 || dlFinished.failed.isNotEmpty()) vm.reconcileSaved()
     }
     // Notification permission (Android 13+): requested on first download
     // so progress survives the app going to the background.
@@ -174,6 +187,20 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
                     }
                 },
                 actions = {
+                    // Transfer status dot: visible whenever the strip
+                    // would show. Reopens a swiped-away strip.
+                    val dls by DownloadService.state.collectAsState()
+                    val dotShow = dls.active != null || dls.queued > 0 ||
+                        dls.failed.isNotEmpty() || dls.parked ||
+                        (dls.linkDown && dls.queued > 0)
+                    if (dotShow) {
+                        IconButton(onClick = {
+                            stripGone = false
+                            showTransfer = true
+                        }) {
+                            TransferDot(dls)
+                        }
+                    }
                     when (vm.conn) {
                         is Conn.Ready -> {
                             IconButton(onClick = {
@@ -228,7 +255,21 @@ fun AppRoot(vm: CamViewModel = viewModel()) {
             }
             // Fullscreen viewer above everything (incl. sheets).
             if (vm.viewerPath != null) ViewerSheet(vm)
-            DlBanner(vm, onOpenSheet = { showTransfer = true })
+            // Strip reset: any phase change brings it back after a swipe.
+            val dlPhase by DownloadService.state.collectAsState()
+            LaunchedEffect(
+                dlPhase.active != null, dlPhase.queued > 0,
+                dlPhase.failed.size, dlPhase.parked, dlPhase.linkDown,
+            ) {
+                stripGone = false
+            }
+            if (!stripGone) {
+                DlBanner(
+                    vm,
+                    onOpenSheet = { showTransfer = true },
+                    onDismiss = { stripGone = true },
+                )
+            }
             if (showTransfer) TransferSheet(vm, onClose = { showTransfer = false })
         }
     }
@@ -901,9 +942,12 @@ private fun PhotoCell(
                     modifier = Modifier.align(Alignment.BottomStart).padding(6.dp),
                 )
             }
-            // Saved badge: verified in MediaStore. Bottom-end dot with a
-            // check (same slot as the queued/active dots: one badge per
-            // corner, never stacked).
+            // Icon language (fixed):
+            // - Saved = filled download mark at half brightness.
+            // - Downloading = hollow download mark, rotating.
+            // - Queued = hollow download mark, static.
+            // - Selecting = check ring (top-start), never a download glyph.
+            // Saved badge: verified in MediaStore. Bottom-end dot.
             if (saved && dl == null) {
                 CellDot(
                     modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp),
@@ -911,9 +955,9 @@ private fun PhotoCell(
                     desc = "保存済み",
                 ) {
                     Icon(
-                        Icons.Default.Check, null,
+                        Icons.Default.Download, null,
                         Modifier.size(14.dp),
-                        tint = MaterialTheme.colorScheme.onPrimary,
+                        tint = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.55f),
                     )
                 }
             }
@@ -947,19 +991,30 @@ private fun PhotoCell(
             }
             // Active mark: highlight pours top-to-bottom with progress,
             // then the pulse sweep keeps moving while bytes flow.
+            // The glyph itself rotates: hollow download, spinning.
             if (dl != null && dl >= 0f) {
                 DownloadPour(
                     progress = dl,
                     modifier = Modifier.fillMaxSize(),
                 )
+                val spin by rememberInfiniteTransition(label = "dlspin").animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = infiniteRepeatable(
+                        animation = androidx.compose.animation.core.tween(1600, easing = LinearEasing),
+                        repeatMode = RepeatMode.Restart,
+                    ),
+                    label = "rot",
+                )
                 CellDot(
                     modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
-                    filled = true,
+                    filled = false,
                     desc = "保存中",
                 ) {
                     Icon(
                         Icons.Default.Downloading, null,
-                        Modifier.size(14.dp),
+                        Modifier.size(14.dp)
+                            .graphicsLayer { rotationZ = spin },
                         tint = MaterialTheme.colorScheme.onPrimary,
                     )
                 }
@@ -1320,18 +1375,14 @@ private fun ZoomHoldButton(label: String, dir: OpcClient.ZoomDir, vm: CamViewMod
 }
 
 /**
- * Slim transfer strip: one line, always above the bottom bar and below
- * the save FAB (FAB hides while busy). Queued/downloaded counts replace
- * the old multi-row card; details live in the transfer sheet.
+ * Slim transfer strip: one line, above the bottom bar. The save FAB
+ * hides while this shows (never stacked). Swipe sideways to dismiss;
+ * the top-bar status dot reopens it. Details live in the sheet.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DlBanner(vm: CamViewModel, onOpenSheet: () -> Unit) {
+private fun DlBanner(vm: CamViewModel, onOpenSheet: () -> Unit, onDismiss: () -> Unit) {
     val s by DownloadService.state.collectAsState()
-    // Downloads finished outside refresh(): re-check MediaStore so saved
-    // veils/badges appear without a manual pull-to-refresh.
-    LaunchedEffect(s.done, s.failed.size) {
-        if (s.done > 0 || s.failed.isNotEmpty()) vm.reconcileSaved()
-    }
     val active = s.active
     // Parked (user stop / link death): the service is gone; the queue is
     // journaled, not running. busy=false so the FAB returns and the strip
@@ -1344,10 +1395,40 @@ private fun DlBanner(vm: CamViewModel, onOpenSheet: () -> Unit) {
     val showable = busy || s.failed.isNotEmpty() || s.parked || (s.linkDown && s.queued > 0)
     if (!showable) return
     val ctx = androidx.compose.ui.platform.LocalContext.current
+    // Swipe-to-dismiss: either direction. currentValue settles to
+    // StartToEnd/EndToStart after the fling; fire once via effect.
+    val dismiss = androidx.compose.material3.rememberSwipeToDismissBoxState()
+    val settled = dismiss.currentValue
+    LaunchedEffect(settled) {
+        if (settled != androidx.compose.material3.SwipeToDismissBoxValue.Settled) {
+            onDismiss()
+        }
+    }
     Box(
         Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp),
         contentAlignment = Alignment.BottomCenter,
     ) {
+        androidx.compose.material3.SwipeToDismissBox(
+            state = dismiss,
+            backgroundContent = {},
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            TransferStripCard(vm, s, busy, parkedIdle, active, ctx, onOpenSheet)
+        }
+    }
+}
+
+/** Strip card body (split for the dismiss wrapper above). */
+@Composable
+private fun TransferStripCard(
+    vm: CamViewModel,
+    s: com.omlight.dl.DlState,
+    busy: Boolean,
+    parkedIdle: Boolean,
+    active: String?,
+    ctx: android.content.Context,
+    onOpenSheet: () -> Unit,
+) {
         Card(
             Modifier.fillMaxWidth().clickable(onClick = onOpenSheet),
         ) {
@@ -1399,6 +1480,49 @@ private fun DlBanner(vm: CamViewModel, onOpenSheet: () -> Unit) {
                 LinearProgressIndicator(
                     progress = { (s.done.toFloat() / total).coerceIn(0f, 1f) },
                     modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+}
+
+/** Top-bar transfer status dot: same icon language as the grid. */
+@Composable
+private fun TransferDot(s: com.omlight.dl.DlState) {
+    val failed = s.failed.isNotEmpty()
+    val busy = s.active != null || s.queued > 0
+    val tint = when {
+        failed -> MaterialTheme.colorScheme.error
+        busy -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Box(contentAlignment = Alignment.Center) {
+        if (busy && !failed) {
+            DownloadingPulse(Modifier.size(24.dp))
+        } else {
+            Icon(
+                when {
+                    failed -> Icons.Default.ErrorOutline
+                    s.parked || s.linkDown -> Icons.Default.PauseCircle
+                    else -> Icons.Default.CheckCircle
+                },
+                "転送状況",
+                tint = tint,
+            )
+        }
+        // Count badge: remaining work at a glance.
+        val n = s.queued + (if (s.active != null) 1 else 0) + s.failed.size
+        if (n > 0) {
+            Box(
+                Modifier.align(Alignment.TopEnd).size(14.dp)
+                    .clip(androidx.compose.foundation.shape.CircleShape)
+                    .background(tint),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (n > 9) "9+" else "$n",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.surface,
+                    maxLines = 1,
                 )
             }
         }

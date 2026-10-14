@@ -312,8 +312,11 @@ class OpcClient(private val t: OpcTransport) {
         // Preview EXIF first: zero extra requests, instant when the body
         // embeds it (E-M5 II). Only bodies that strip preview EXIF
         // (E-M10) fall through to the CGI + head-fetch path below.
+        // NOTE: the preview is a transcoded 1920-or-smaller JPEG, so its
+        // EXIF size row LIES (a 4608x3456 original reports 1920x1440).
+        // Strip it here; the true size comes from the original head below.
         var exif = if (preview != null) {
-            PhotoInfoParse.fromJpeg(preview)
+            with(PhotoInfoParse) { PhotoInfoParse.fromJpeg(preview).withoutSize() }
         } else {
             PhotoInfo()
         }
@@ -346,9 +349,12 @@ class OpcClient(private val t: OpcTransport) {
                 PhotoInfo()
             }
         }
-        // Previews on some bodies (E-M10) strip EXIF: fetch the original's
-        // head (EXIF lives in the first ~64KB) as a last resort.
-        if (exif.rows.size <= 1 && !path.substringAfterLast('.', "").uppercase().let {
+        // Original head: EXIF lives in the first ~64KB. ALWAYS fetched
+        // for stills (not just when preview EXIF is missing): the head
+        // carries the TRUE original dimensions + full shooting data,
+        // while the preview transcoding may lie or strip tags. Movies
+        // skip this (no EXIF in MP4 heads; X-Movie-Size covers them).
+        if (!path.substringAfterLast('.', "").uppercase().let {
                 it == "MOV" || it == "AVI" || it == "MP4"
             }
         ) {
@@ -375,7 +381,25 @@ class OpcClient(private val t: OpcTransport) {
                         } else {
                             PhotoInfoParse.fromJpeg(head)
                         }
-                        if (headExif.rows.size > exif.rows.size) exif = headExif
+                        // SOF size wins over any EXIF size row: the frame
+                        // header is ground truth for THESE bytes (ExifInterface
+                        // silently drops PixelXDimension on some heads).
+                        val dims = PhotoInfoParse.jpegDims(head)
+                        val sized = if (dims != null) {
+                            with(PhotoInfoParse) {
+                                // Size FIRST: the most-wanted row must be
+                                // visible without scrolling the sheet.
+                                PhotoInfo(
+                                    listOf("サイズ" to "${dims.first}×${dims.second}") +
+                                        headExif.withoutSize().rows
+                                )
+                            }
+                        } else {
+                            headExif
+                        }
+                        // Head wins outright when it parsed: original truth
+                        // beats preview truth on every row.
+                        if (sized.rows.isNotEmpty()) exif = PhotoInfoParse.merge(sized, exif)
                     }
                 }
             } catch (_: Exception) { /* keep preview EXIF */ }

@@ -72,6 +72,11 @@ def make_jpeg(w: int, h: int, label: str, hue: int, exif: bool = False) -> bytes
                 piexif.ExifIFD.MeteringMode: 5,
                 piexif.ExifIFD.ExposureProgram: 3,
                 piexif.ExifIFD.ColorSpace: 1,
+                # True pixel dims of THIS file. Originals are 4608x3456
+                # (16MP body), screens are 640x480 transcodes: the size
+                # row must come from the original, never the preview.
+                piexif.ExifIFD.PixelXDimension: w,
+                piexif.ExifIFD.PixelYDimension: h,
             }
             img.save(buf, "JPEG", quality=85,
                      exif=piexif.dump({"0th": zeroth, "Exif": exif_ifd}))
@@ -108,7 +113,7 @@ def add_photo(tag: str, folder: str = "/DCIM/100OLYMP", raw: bool = False) -> di
         _st.pack_into("<II", blob, 150, 28, 10)
         full = bytes(blob)
     else:
-        full = make_jpeg(1920, 1440, f"{tag} {name}", 40 + n * 37, exif=True)
+        full = make_jpeg(4608, 3456, f"{tag} {name}", 40 + n * 37, exif=True)
     ROLL.append({
         "name": name, "dir": folder,
         "bytes": full,
